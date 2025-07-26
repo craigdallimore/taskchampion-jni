@@ -14,3 +14,5 @@ JNI bindings for the [TaskChampion](https://github.com/GothenburgBitFactory/task
 ## License
 
 MIT
+
+This project contains JNI bindings for [TaskChampion](https://github.com/GothenburgBitFactory/taskchampion), which is also licensed under the [MIT License](https://github.com/GothenburgBitFactory/taskchampion?tab=MIT-1-ov-file#readme).
