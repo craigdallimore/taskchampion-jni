@@ -1,0 +1,145 @@
+plugins {
+    id 'com.android.library'
+    id 'maven-publish'
+}
+
+android {
+    namespace 'com.tasksquire.data.storage'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 21
+        targetSdk 34
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    packagingOptions {
+        pickFirst '**/libc++_shared.so'
+        pickFirst '**/libtaskchampion_jni.so'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.12.0'
+    
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+}
+
+// Configure Rust build
+task cargoClean(type: Exec) {
+    workingDir project.projectDir
+    commandLine 'cargo', 'clean'
+}
+
+task cargoBuildArm64(type: Exec) {
+    workingDir project.projectDir
+    commandLine 'cargo', 'build', '--release', '--target', 'aarch64-linux-android'
+}
+
+task cargoBuildArm(type: Exec) {
+    workingDir project.projectDir
+    commandLine 'cargo', 'build', '--release', '--target', 'armv7-linux-androideabi'
+}
+
+task cargoBuildX86(type: Exec) {
+    workingDir project.projectDir
+    commandLine 'cargo', 'build', '--release', '--target', 'i686-linux-android'
+}
+
+task cargoBuildX86_64(type: Exec) {
+    workingDir project.projectDir
+    commandLine 'cargo', 'build', '--release', '--target', 'x86_64-linux-android'
+}
+
+task copyRustLibs(type: Copy) {
+    dependsOn cargoBuildArm64, cargoBuildArm, cargoBuildX86, cargoBuildX86_64
+    
+    from("target/aarch64-linux-android/release") {
+        include "libtaskchampion_jni.so"
+        into "arm64-v8a"
+    }
+    from("target/armv7-linux-androideabi/release") {
+        include "libtaskchampion_jni.so"
+        into "armeabi-v7a"
+    }
+    from("target/i686-linux-android/release") {
+        include "libtaskchampion_jni.so"
+        into "x86"
+    }
+    from("target/x86_64-linux-android/release") {
+        include "libtaskchampion_jni.so"
+        into "x86_64"
+    }
+    
+    into "src/main/jniLibs"
+}
+
+preBuild.dependsOn copyRustLibs
+clean.dependsOn cargoClean
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                
+                groupId = 'io.github.craigdallimore'
+                artifactId = 'taskchampion-jni'
+                version = '0.1.0-alpha'
+                
+                pom {
+                    name = 'TaskChampion JNI'
+                    description = 'JNI bindings for TaskChampion task management library'
+                    url = 'https://github.com/craigdallimore/taskchampion-jni'
+                    
+                    licenses {
+                        license {
+                            name = 'MIT License'
+                            url = 'https://opensource.org/licenses/MIT'
+                        }
+                    }
+                    
+                    developers {
+                        developer {
+                            id = 'craigdallimore'
+                            name = 'Craig Dallimore'
+                            email = 'decoy9697@gmail.com'
+                        }
+                    }
+                    
+                    scm {
+                        connection = 'scm:git:git://github.com/craigdallimore/taskchampion-jni.git'
+                        developerConnection = 'scm:git:ssh://github.com:craigdallimore/taskchampion-jni.git'
+                        url = 'https://github.com/craigdallimore/taskchampion-jni/tree/main'
+                    }
+                }
+            }
+        }
+    }
+}
