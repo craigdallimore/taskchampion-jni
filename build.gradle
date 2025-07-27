@@ -86,7 +86,9 @@ afterEvaluate {
     publishing {
         publications {
             release(MavenPublication) {
-                // from components.release
+                afterEvaluate {
+                    artifact(bundleReleaseAar)
+                }
                 
                 groupId = 'io.github.craigdallimore'
                 artifactId = 'taskchampion-jni'
@@ -117,6 +119,16 @@ afterEvaluate {
                         developerConnection = 'scm:git:ssh://github.com:craigdallimore/taskchampion-jni.git'
                         url = 'https://github.com/craigdallimore/taskchampion-jni/tree/main'
                     }
+                }
+            }
+        }
+        repositories {
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/craigdallimore/taskchampion-jni")
+                credentials {
+                    username = project.findProperty("gpr.user") ?: System.getenv("USERNAME")
+                    password = project.findProperty("gpr.key") ?: System.getenv("TOKEN")
                 }
             }
         }

@@ -76,6 +76,12 @@ jobs:
     - name: Build Android AAR
       run: ./gradlew assembleRelease
     
+    - name: Publish to GitHub Packages
+      run: ./gradlew publishReleasePublicationToGitHubPackagesRepository
+      env:
+        USERNAME: ${{ github.actor }}
+        TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
     - name: Upload AAR artifact
       uses: actions/upload-artifact@v4
       with:

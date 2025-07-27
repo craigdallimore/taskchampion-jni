@@ -1,7 +1,4 @@
-- fix build on github
 - get tasksquire using artifacts from github or whatever
-- address rust test warning
-- make gradle tests work
 - check if this is published anywhere publically, and tidy that up. Maven? Gradle?
 - add outstanding unimplmented APIs
 - add documentation for API usage
