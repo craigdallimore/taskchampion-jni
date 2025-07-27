@@ -1,5 +1,4 @@
 use std::sync::Once;
-use std::fmt::Write;
 
 static LOGGER_INIT: Once = Once::new();
 
