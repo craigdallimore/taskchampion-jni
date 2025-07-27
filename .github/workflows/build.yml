@@ -64,6 +64,9 @@ jobs:
     - name: Run Rust tests
       run: cargo test --verbose
     
+    - name: Run Gradle tests
+      run: ./gradlew test
+    
     - name: Build Rust JNI library
       run: ./gradlew buildRustJNI
       env:

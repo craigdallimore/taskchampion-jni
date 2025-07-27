@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -e
+
+echo "🧪 Running pre-commit tests..."
+
+# Run Rust tests
+echo "📦 Running Rust tests..."
+cargo test --quiet
+
+# Run Gradle tests  
+echo "🎯 Running Gradle tests..."
+./gradlew test --quiet
+
+# Check Rust formatting
+echo "🎨 Checking Rust formatting..."
+cargo fmt --check
+
+# Run Rust linting
+echo "🔍 Running Rust linting..."
+cargo clippy -- -D warnings
+
+echo "✅ All pre-commit checks passed!"
