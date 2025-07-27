@@ -1,5 +1,5 @@
 plugins {
-    id 'com.android.library'
+    id 'com.android.library' version '8.2.2'
     id 'maven-publish'
 }
 
@@ -57,57 +57,36 @@ task cargoClean(type: Exec) {
     commandLine 'cargo', 'clean'
 }
 
-task cargoBuildArm64(type: Exec) {
+task buildRustJNI(type: Exec) {
+    group = 'rust'
+    description = 'Build Rust JNI library for arm64-v8a only'
     workingDir project.projectDir
-    commandLine 'cargo', 'build', '--release', '--target', 'aarch64-linux-android'
-}
-
-task cargoBuildArm(type: Exec) {
-    workingDir project.projectDir
-    commandLine 'cargo', 'build', '--release', '--target', 'armv7-linux-androideabi'
-}
-
-task cargoBuildX86(type: Exec) {
-    workingDir project.projectDir
-    commandLine 'cargo', 'build', '--release', '--target', 'i686-linux-android'
-}
-
-task cargoBuildX86_64(type: Exec) {
-    workingDir project.projectDir
-    commandLine 'cargo', 'build', '--release', '--target', 'x86_64-linux-android'
-}
-
-task copyRustLibs(type: Copy) {
-    dependsOn cargoBuildArm64, cargoBuildArm, cargoBuildX86, cargoBuildX86_64
+    commandLine 'cargo', 'ndk', '--target', 'arm64-v8a', '--platform', '26', '--', 'build'
     
-    from("target/aarch64-linux-android/release") {
-        include "libtaskchampion_jni.so"
-        into "arm64-v8a"
-    }
-    from("target/armv7-linux-androideabi/release") {
-        include "libtaskchampion_jni.so"
-        into "armeabi-v7a"
-    }
-    from("target/i686-linux-android/release") {
-        include "libtaskchampion_jni.so"
-        into "x86"
-    }
-    from("target/x86_64-linux-android/release") {
-        include "libtaskchampion_jni.so"
-        into "x86_64"
-    }
+    // Pass environment variables to disable assembly optimizations for aws-lc-sys
+    environment 'AWS_LC_SYS_NO_ASM_aarch64_linux_android', '1'
+    environment 'AWS_LC_SYS_NO_ASM', '1'
     
-    into "src/main/jniLibs"
+    // Set outputs for UP-TO-DATE checking
+    outputs.file('target/aarch64-linux-android/debug/libtaskchampion_jni.so')
 }
 
-preBuild.dependsOn copyRustLibs
+task copyRustJNI(type: Copy) {
+    group = 'rust'
+    description = 'Copy built Rust library to jniLibs'
+    dependsOn buildRustJNI
+    from 'target/aarch64-linux-android/debug/libtaskchampion_jni.so'
+    into 'src/main/jniLibs/arm64-v8a/'
+}
+
+// preBuild.dependsOn copyRustLibs  // Build Rust separately first
 clean.dependsOn cargoClean
 
 afterEvaluate {
     publishing {
         publications {
             release(MavenPublication) {
-                from components.release
+                // from components.release
                 
                 groupId = 'io.github.craigdallimore'
                 artifactId = 'taskchampion-jni'

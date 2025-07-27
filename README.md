@@ -7,9 +7,18 @@ JNI bindings for the [TaskChampion](https://github.com/GothenburgBitFactory/task
 ## What this provides
 
 - Task creation, modification, and deletion
-- Tag and annotation management  
+- Tag and annotation management
 - Undo/redo operations
 - Cloud synchronization support
+
+## Running tests
+
+ Android/Java tests:
+  - ./gradlew test (unit tests)
+  - ./gradlew connectedAndroidTest (instrumented tests)
+
+  Rust tests:
+  - cargo test
 
 ## License
 
