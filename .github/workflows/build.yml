@@ -31,6 +31,9 @@ jobs:
       with:
         targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
     
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
+    
     - name: Install Android NDK
       run: |
         echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;26.1.10909125"
@@ -60,6 +63,12 @@ jobs:
     
     - name: Run Rust tests
       run: cargo test --verbose
+    
+    - name: Build Rust JNI library
+      run: ./gradlew buildRustJNI
+      env:
+        AWS_LC_SYS_NO_ASM_aarch64_linux_android: 1
+        AWS_LC_SYS_NO_ASM: 1
     
     - name: Build Android AAR
       run: ./gradlew assembleRelease

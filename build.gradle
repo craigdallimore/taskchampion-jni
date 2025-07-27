@@ -79,7 +79,7 @@ task copyRustJNI(type: Copy) {
     into 'src/main/jniLibs/arm64-v8a/'
 }
 
-// preBuild.dependsOn copyRustLibs  // Build Rust separately first
+preBuild.dependsOn copyRustJNI
 clean.dependsOn cargoClean
 
 afterEvaluate {
