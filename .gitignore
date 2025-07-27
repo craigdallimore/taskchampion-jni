@@ -1,1 +1,8 @@
 target
+
+# Gradle
+.gradle/
+build/
+
+# Android JNI build artifacts
+src/main/jniLibs/
