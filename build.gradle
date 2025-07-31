@@ -61,25 +61,17 @@ task buildRustJNI(type: Exec) {
     group = 'rust'
     description = 'Build Rust JNI library for arm64-v8a only'
     workingDir project.projectDir
-    commandLine 'cargo', 'ndk', '--target', 'arm64-v8a', '--platform', '26', '--', 'build'
+    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-o', 'src/main/jniLibs', 'build'
     
     // Pass environment variables to disable assembly optimizations for aws-lc-sys
     environment 'AWS_LC_SYS_NO_ASM_aarch64_linux_android', '1'
     environment 'AWS_LC_SYS_NO_ASM', '1'
     
     // Set outputs for UP-TO-DATE checking
-    outputs.file('target/aarch64-linux-android/debug/libtaskchampion_jni.so')
+    outputs.file('src/main/jniLibs/arm64-v8a/libtaskchampion_jni.so')
 }
 
-task copyRustJNI(type: Copy) {
-    group = 'rust'
-    description = 'Copy built Rust library to jniLibs'
-    dependsOn buildRustJNI
-    from 'target/aarch64-linux-android/debug/libtaskchampion_jni.so'
-    into 'src/main/jniLibs/arm64-v8a/'
-}
-
-preBuild.dependsOn copyRustJNI
+preBuild.dependsOn buildRustJNI
 clean.dependsOn cargoClean
 
 afterEvaluate {
