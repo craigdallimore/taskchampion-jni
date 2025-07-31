@@ -71,17 +71,31 @@ jobs:
       id: version
       run: |
         # Get current version from build.gradle
-        CURRENT_VERSION=$(grep "version = '" build.gradle | sed "s/.*version = '\(.*\)'.*/\1/")
+        CURRENT_VERSION=$(grep "version = '" build.gradle | head -1 | sed "s/.*version = '\(.*\)'.*/\1/")
         echo "Current version: $CURRENT_VERSION"
         
+        # Validate version was found
+        if [ -z "$CURRENT_VERSION" ]; then
+          echo "Error: Could not extract version from build.gradle"
+          exit 1
+        fi
+        
         # Extract base version (remove -alpha suffix)
-        BASE_VERSION=$(echo $CURRENT_VERSION | sed 's/-alpha//')
+        BASE_VERSION=$(echo $CURRENT_VERSION | sed 's/-alpha$//')
+        echo "Base version: $BASE_VERSION"
         
         # Increment patch version
         IFS='.' read -ra VERSION_PARTS <<< "$BASE_VERSION"
         MAJOR=${VERSION_PARTS[0]}
         MINOR=${VERSION_PARTS[1]}
         PATCH=${VERSION_PARTS[2]}
+        
+        # Validate version parts
+        if [ -z "$MAJOR" ] || [ -z "$MINOR" ] || [ -z "$PATCH" ]; then
+          echo "Error: Invalid version format: $BASE_VERSION"
+          exit 1
+        fi
+        
         NEW_PATCH=$((PATCH + 1))
         NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-alpha"
         
@@ -89,6 +103,15 @@ jobs:
         
         # Update build.gradle
         sed -i "s/version = '$CURRENT_VERSION'/version = '$NEW_VERSION'/" build.gradle
+        
+        # Verify the change was made
+        UPDATED_VERSION=$(grep "version = '" build.gradle | head -1 | sed "s/.*version = '\(.*\)'.*/\1/")
+        echo "Updated version in file: $UPDATED_VERSION"
+        
+        if [ "$UPDATED_VERSION" != "$NEW_VERSION" ]; then
+          echo "Error: Version update failed"
+          exit 1
+        fi
         
         # Set outputs
         echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
