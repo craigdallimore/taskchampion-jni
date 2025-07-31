@@ -84,7 +84,7 @@ afterEvaluate {
                 
                 groupId = 'io.github.craigdallimore'
                 artifactId = 'taskchampion-jni'
-                version = '0.1.1-alpha'
+                version = '0.1.2-alpha'
                 
                 pom {
                     name = 'TaskChampion JNI'
