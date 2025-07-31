@@ -1,0 +1,12 @@
+jdk:
+  - openjdk17
+before_install:
+  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  - source ~/.cargo/env
+  - rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+  - cargo install cargo-ndk
+  - echo "ANDROID_NDK_HOME=/opt/android-sdk-linux/ndk/26.3.11579264" >> $GITHUB_ENV
+  - echo "ANDROID_NDK_ROOT=/opt/android-sdk-linux/ndk/26.3.11579264" >> $GITHUB_ENV
+install:
+  - echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --install "ndk;26.3.11579264"
+  - ./gradlew clean assemble publishToMavenLocal -x test
