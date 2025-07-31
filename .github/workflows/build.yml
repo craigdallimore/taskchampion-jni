@@ -65,6 +65,40 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-gradle-
     
+    - name: Auto-increment version
+      id: version
+      run: |
+        # Get current version from build.gradle
+        CURRENT_VERSION=$(grep "version = '" build.gradle | sed "s/.*version = '\(.*\)'.*/\1/")
+        echo "Current version: $CURRENT_VERSION"
+        
+        # Extract base version (remove -alpha suffix)
+        BASE_VERSION=$(echo $CURRENT_VERSION | sed 's/-alpha//')
+        
+        # Increment patch version
+        IFS='.' read -ra VERSION_PARTS <<< "$BASE_VERSION"
+        MAJOR=${VERSION_PARTS[0]}
+        MINOR=${VERSION_PARTS[1]}
+        PATCH=${VERSION_PARTS[2]}
+        NEW_PATCH=$((PATCH + 1))
+        NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-alpha"
+        
+        echo "New version: $NEW_VERSION"
+        
+        # Update build.gradle
+        sed -i "s/version = '$CURRENT_VERSION'/version = '$NEW_VERSION'/" build.gradle
+        
+        # Set outputs
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+    
+    - name: Commit version bump
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add build.gradle
+        git commit -m "Auto-bump version to ${{ steps.version.outputs.version }}" || exit 0
+    
     - name: Run Rust tests
       run: cargo test --verbose
     
@@ -82,6 +116,14 @@ jobs:
       env:
         USERNAME: ${{ github.actor }}
         TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Create and push tag
+      run: |
+        git tag ${{ steps.version.outputs.tag }}
+        git push origin ${{ steps.version.outputs.tag }}
+        git push origin main
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     
     - name: Upload AAR artifact
       uses: actions/upload-artifact@v4
