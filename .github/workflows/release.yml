@@ -74,9 +74,17 @@ jobs:
     - name: Calculate next version
       id: version
       run: |
+        # Debug: Show all current tags
+        echo "All tags:"
+        git tag -l | sort -V | tail -5 || echo "No tags found"
+        
         # Get current version from git tags, not build files
         LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.1.0-alpha")
         echo "Latest tag: $LATEST_TAG"
+        
+        # Debug: Show current build.gradle version
+        echo "Current build.gradle version:"
+        grep "version = '" build.gradle || echo "No version found in build.gradle"
         
         # Parse version (remove 'v' prefix and '-alpha' suffix)
         VERSION_NUM=$(echo $LATEST_TAG | sed 's/^v//' | sed 's/-alpha$//')
@@ -99,12 +107,16 @@ jobs:
         echo "New version: $NEW_VERSION"
         echo "New tag: $NEW_TAG"
         
-        # Update build.gradle using proper parsing
-        perl -i -pe "s/version = '[^']*'/version = '$NEW_VERSION'/g" build.gradle
+        # Update build.gradle using sed (more reliable in CI)
+        sed -i "s/version = '[^']*'/version = '$NEW_VERSION'/g" build.gradle
         
         # Verify update
-        if ! grep -q "version = '$NEW_VERSION'" build.gradle; then
-          echo "ERROR: Failed to update build.gradle"
+        UPDATED_VERSION=$(grep "version = '" build.gradle | head -1 | sed "s/.*version = '\([^']*\)'.*/\1/")
+        echo "Updated version in build.gradle: $UPDATED_VERSION"
+        
+        if [ "$UPDATED_VERSION" != "$NEW_VERSION" ]; then
+          echo "ERROR: Failed to update build.gradle. Expected: $NEW_VERSION, Got: $UPDATED_VERSION"
+          cat build.gradle | grep -A2 -B2 "version ="
           exit 1
         fi
         
