@@ -78,16 +78,35 @@ jobs:
         echo "All tags:"
         git tag -l | sort -V | tail -5 || echo "No tags found"
         
-        # Get current version from git tags, not build files
-        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.1.0-alpha")
+        # Get current version from git tags, not build files  
+        LATEST_TAG=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-alpha$' | sort -V | tail -1)
+        if [ -z "$LATEST_TAG" ]; then
+          LATEST_TAG="v0.1.0-alpha"
+        fi
         echo "Latest tag: $LATEST_TAG"
         
         # Debug: Show current build.gradle version
         echo "Current build.gradle version:"
-        grep "version = '" build.gradle || echo "No version found in build.gradle"
+        CURRENT_BUILD_VERSION=$(grep "version = '" build.gradle | head -1 | sed "s/.*version = '\([^']*\)'.*/\1/")
+        echo "  $CURRENT_BUILD_VERSION"
         
-        # Parse version (remove 'v' prefix and '-alpha' suffix)
-        VERSION_NUM=$(echo $LATEST_TAG | sed 's/^v//' | sed 's/-alpha$//')
+        # Parse latest tag version
+        TAG_VERSION_NUM=$(echo $LATEST_TAG | sed 's/^v//' | sed 's/-alpha$//')
+        
+        # Parse current build.gradle version  
+        BUILD_VERSION_NUM=$(echo $CURRENT_BUILD_VERSION | sed 's/-alpha$//')
+        
+        # Use the higher version as base
+        if [[ "$BUILD_VERSION_NUM" > "$TAG_VERSION_NUM" ]]; then
+          echo "Using build.gradle version ($CURRENT_BUILD_VERSION) as base (newer than git tag)"
+          BASE_VERSION=$CURRENT_BUILD_VERSION
+        else
+          echo "Using git tag version ($LATEST_TAG) as base"
+          BASE_VERSION=$TAG_VERSION_NUM
+        fi
+        
+        # Parse base version
+        VERSION_NUM=$(echo $BASE_VERSION | sed 's/^v//' | sed 's/-alpha$//')
         IFS='.' read -ra PARTS <<< "$VERSION_NUM"
         MAJOR=${PARTS[0]:-0}
         MINOR=${PARTS[1]:-1}
