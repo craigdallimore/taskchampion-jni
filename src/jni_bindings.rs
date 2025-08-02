@@ -2,6 +2,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jint, jlong, jobjectArray};
 use jni::JNIEnv;
 use taskchampion::{Replica, StorageConfig, Operations, Operation, Status, Tag, Annotation, ServerConfig};
+use taskchampion::server::AwsCredentials;
 use uuid::Uuid;
 use chrono::Utc;
 use log::{info, error, warn};
@@ -1192,7 +1193,18 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         }
     };
 
-    // Extract GCP configuration from JSON
+    // Determine server type and create appropriate configuration
+    let server_type = match server_config_data.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => {
+            error!("Missing 'type' field in server config");
+            return match env.new_string("ERROR: Missing 'type' field") {
+                Ok(s) => s,
+                Err(_) => JObject::null().into(),
+            };
+        }
+    };
+
     let bucket = match server_config_data.get("bucket").and_then(|v| v.as_str()) {
         Some(b) => b.to_string(),
         None => {
@@ -1203,11 +1215,6 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             };
         }
     };
-
-    let credential_path = server_config_data
-        .get("credential_path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
 
     let encryption_secret = match server_config_data.get("encryption_secret").and_then(|v| v.as_str()) {
         Some(secret) => {
@@ -1229,11 +1236,121 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         }
     };
 
-    // Create TaskChampion ServerConfig
-    let server_config = ServerConfig::Gcp {
-        bucket,
-        credential_path,
-        encryption_secret,
+    // Create TaskChampion ServerConfig based on type
+    let server_config = match server_type {
+        "gcp" => {
+            let credential_path = server_config_data
+                .get("credential_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            ServerConfig::Gcp {
+                bucket,
+                credential_path,
+                encryption_secret,
+            }
+        }
+        "aws" => {
+            let region = match server_config_data.get("region").and_then(|v| v.as_str()) {
+                Some(r) => r.to_string(),
+                None => {
+                    error!("Missing 'region' field in AWS server config");
+                    return match env.new_string("ERROR: Missing 'region' field for AWS") {
+                        Ok(s) => s,
+                        Err(_) => JObject::null().into(),
+                    };
+                }
+            };
+
+            let credentials = match server_config_data.get("credentials") {
+                Some(cred_data) => {
+                    let cred_type = match cred_data.get("type").and_then(|v| v.as_str()) {
+                        Some(t) => t,
+                        None => {
+                            error!("Missing 'type' field in AWS credentials");
+                            return match env.new_string("ERROR: Missing 'type' field in AWS credentials") {
+                                Ok(s) => s,
+                                Err(_) => JObject::null().into(),
+                            };
+                        }
+                    };
+
+                    match cred_type {
+                        "access_key" => {
+                            let access_key_id = match cred_data.get("access_key_id").and_then(|v| v.as_str()) {
+                                Some(id) => id.to_string(),
+                                None => {
+                                    error!("Missing 'access_key_id' field in AWS access key credentials");
+                                    return match env.new_string("ERROR: Missing 'access_key_id' field") {
+                                        Ok(s) => s,
+                                        Err(_) => JObject::null().into(),
+                                    };
+                                }
+                            };
+
+                            let secret_access_key = match cred_data.get("secret_access_key").and_then(|v| v.as_str()) {
+                                Some(key) => key.to_string(),
+                                None => {
+                                    error!("Missing 'secret_access_key' field in AWS access key credentials");
+                                    return match env.new_string("ERROR: Missing 'secret_access_key' field") {
+                                        Ok(s) => s,
+                                        Err(_) => JObject::null().into(),
+                                    };
+                                }
+                            };
+
+                            AwsCredentials::AccessKey {
+                                access_key_id,
+                                secret_access_key,
+                            }
+                        }
+                        "profile" => {
+                            let profile_name = match cred_data.get("profile_name").and_then(|v| v.as_str()) {
+                                Some(name) => name.to_string(),
+                                None => {
+                                    error!("Missing 'profile_name' field in AWS profile credentials");
+                                    return match env.new_string("ERROR: Missing 'profile_name' field") {
+                                        Ok(s) => s,
+                                        Err(_) => JObject::null().into(),
+                                    };
+                                }
+                            };
+
+                            AwsCredentials::Profile { profile_name }
+                        }
+                        "default" => AwsCredentials::Default,
+                        _ => {
+                            error!("Unknown AWS credential type: {}", cred_type);
+                            return match env.new_string(&format!("ERROR: Unknown AWS credential type: {}", cred_type)) {
+                                Ok(s) => s,
+                                Err(_) => JObject::null().into(),
+                            };
+                        }
+                    }
+                }
+                None => {
+                    error!("Missing 'credentials' field in AWS server config");
+                    return match env.new_string("ERROR: Missing 'credentials' field for AWS") {
+                        Ok(s) => s,
+                        Err(_) => JObject::null().into(),
+                    };
+                }
+            };
+
+            ServerConfig::Aws {
+                region,
+                bucket,
+                credentials,
+                encryption_secret,
+            }
+        }
+        _ => {
+            error!("Unknown server type: {}", server_type);
+            return match env.new_string(&format!("ERROR: Unknown server type: {}", server_type)) {
+                Ok(s) => s,
+                Err(_) => JObject::null().into(),
+            };
+        }
     };
 
     info!("Created server config, starting sync operation");

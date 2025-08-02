@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "taskchampion-jni"
-version = "0.1.0"
+version = "0.1.11-alpha"
 dependencies = [
  "android_logger",
  "chrono",
