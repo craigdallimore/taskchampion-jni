@@ -61,6 +61,7 @@
 
             # Development tools
             git
+            gh
             curl
             wget
             unzip
