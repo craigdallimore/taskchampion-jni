@@ -1,6 +1,6 @@
 [package]
 name = "taskchampion-jni"
-version = "0.1.13-alpha"
+version = "0.1.14-alpha"
 edition = "2021"
 
 [lib]
