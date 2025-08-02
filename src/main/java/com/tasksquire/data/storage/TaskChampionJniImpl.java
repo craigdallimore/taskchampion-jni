@@ -151,6 +151,17 @@ public class TaskChampionJniImpl {
      */
     public static native String nativeGetUuidForIndex(long replicaPtr, int index);
     
+    // Task Management
+    
+    /**
+     * Clear all tasks from the replica by setting them to deleted status.
+     * This is useful for switching sync profiles without affecting server data.
+     * 
+     * @param replicaPtr Pointer to the replica
+     * @return true if clearing was successful
+     */
+    public static native boolean nativeClearAllTasks(long replicaPtr);
+    
     // Synchronization
     
     /**

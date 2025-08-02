@@ -1098,6 +1098,58 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     })
 }
 
+// Task Management
+
+#[no_mangle]
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeClearAllTasks(
+    _env: JNIEnv,
+    _class: JClass,
+    replica_ptr: jlong,
+) -> jboolean {
+    if replica_ptr == 0 {
+        error!("Null replica pointer passed to nativeClearAllTasks");
+        return 0;
+    }
+
+    with_replica_lock!(replica_ptr, "nativeClearAllTasks", 0, {
+        unsafe {
+            let replica = &mut *(replica_ptr as *mut Replica);
+            
+            match clear_all_tasks_internal(replica) {
+                Ok(_) => {
+                    info!("All tasks cleared successfully");
+                    1
+                }
+                Err(e) => {
+                    error!("Failed to clear all tasks: {:?}", e);
+                    0
+                }
+            }
+        }
+    })
+}
+
+fn clear_all_tasks_internal(replica: &mut Replica) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ops = Operations::new();
+    ops.push(Operation::UndoPoint);
+    
+    // Get all tasks and delete them
+    let all_tasks = replica.all_tasks()?;
+    let all_uuids: Vec<_> = all_tasks.keys().cloned().collect();
+    info!("Clearing {} tasks", all_uuids.len());
+    
+    for uuid in all_uuids {
+        if let Some(mut task) = replica.get_task(uuid)? {
+            task.set_status(Status::Deleted, &mut ops)?;
+        }
+    }
+    
+    replica.commit_operations(ops)?;
+    replica.rebuild_working_set(true)?;
+    
+    Ok(())
+}
+
 // Synchronization
 
 #[no_mangle]
