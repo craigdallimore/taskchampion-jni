@@ -2886,16 +2886,17 @@ dependencies = [
 
 [[package]]
 name = "taskchampion-jni"
-version = "0.1.11-alpha"
+version = "0.1.13-alpha"
 dependencies = [
  "android_logger",
  "chrono",
  "dashmap",
+ "hyper-rustls 0.27.7",
  "jni",
  "lazy_static",
  "log",
+ "reqwest",
  "rustls 0.23.29",
- "rustls-native-certs 0.8.1",
  "serde",
  "serde_json",
  "taskchampion",

@@ -8,6 +8,7 @@ use chrono::Utc;
 use log::{info, error, warn};
 use serde_json;
 use std::env;
+use std::panic;
 use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
@@ -1381,7 +1382,13 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             
             match server_config.into_server() {
                 Ok(mut server) => {
-                    match replica.sync(&mut server, false) {
+                    // Wrap sync operation in panic handler to catch TLS certificate panics
+                    let sync_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        replica.sync(&mut server, false)
+                    }));
+                    
+                    match sync_result {
+                        Ok(sync_result) => match sync_result {
                         Ok(()) => {
                             info!("Sync completed successfully");
                             
@@ -1406,6 +1413,14 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
                         Err(e) => {
                             error!("Sync failed: {:?}", e);
                             match env.new_string(&format!("ERROR: Sync failed - {}", e)) {
+                                Ok(s) => s,
+                                Err(_) => JObject::null().into(),
+                            }
+                        }
+                        }
+                        Err(panic_err) => {
+                            error!("Sync operation panicked (likely TLS certificate issue): {:?}", panic_err);
+                            match env.new_string("ERROR: Sync failed due to TLS certificate issue on Android. This is a known limitation with AWS sync on Android.") {
                                 Ok(s) => s,
                                 Err(_) => JObject::null().into(),
                             }
