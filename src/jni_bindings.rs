@@ -7,10 +7,21 @@ use uuid::Uuid;
 use chrono::Utc;
 use log::{info, error, warn};
 use serde_json;
+use std::env;
 use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use crate::logging::init_android_logger;
+
+/// Configure TLS to use bundled certificates instead of native Android certificate store
+/// This prevents SIGABRT crashes when rustls-native-certs fails to find Android certificates
+fn configure_android_tls() {
+    // Disable native certificate loading and force webpki-roots usage
+    env::set_var("RUSTLS_NATIVE_CERTS", "0");
+    // Force AWS SDK to use bundled certificates
+    env::set_var("AWS_USE_BUNDLED_CA", "1");
+    info!("Configured TLS to use bundled certificates for Android compatibility");
+}
 
 // Per-replica mutex registry for thread safety
 lazy_static! {
@@ -105,6 +116,9 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
 ) -> jlong {
     // Initialize Android logger
     init_android_logger();
+    
+    // Configure TLS for Android compatibility
+    configure_android_tls();
     
     let data_dir_str: String = match env.get_string(&data_dir) {
         Ok(s) => s.into(),
@@ -1180,6 +1194,9 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     };
 
     info!("Starting sync with config: {}", server_config_str);
+    
+    // Configure TLS for Android - force use of bundled certificates
+    configure_android_tls();
 
     // Parse the JSON to extract server configuration
     let server_config_data: serde_json::Value = match serde_json::from_str(&server_config_str) {
