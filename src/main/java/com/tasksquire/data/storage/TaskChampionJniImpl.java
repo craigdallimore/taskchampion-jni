@@ -1,17 +1,97 @@
 package com.tasksquire.data.storage;
 
 /**
- * TaskChampion JNI implementation for Android
- * 
- * This class provides Java bindings for the TaskChampion Rust library,
- * enabling task management functionality in Android applications.
- * 
- * Features:
- * - Task creation, modification, and deletion
- * - Tag and annotation management
- * - Synchronization with cloud storage
- * - Undo/redo operations
- * - Working set management
+ * Java bindings for the <a href="https://github.com/GothenburgBitFactory/taskchampion">TaskChampion</a>
+ * task-management library, intended for use from Android (and any other JVM
+ * environment) applications.
+ *
+ * <h2>Capabilities</h2>
+ * <ul>
+ *   <li>Task creation, modification, and queries</li>
+ *   <li>Tag and annotation management</li>
+ *   <li>Arbitrary key/value attributes per task</li>
+ *   <li>Undo via undo points in the operation journal</li>
+ *   <li>Synchronisation with a remote storage server (Google Cloud Storage
+ *       or AWS S3-compatible)</li>
+ * </ul>
+ *
+ * <h2>Threading model</h2>
+ * <p>All native methods are <strong>synchronous</strong> and may block. They
+ * must be called <strong>off the main thread</strong>: a sync operation can
+ * involve a network round-trip, and even local operations acquire a
+ * per-replica mutex that may be held by another thread.
+ *
+ * <p>Per-replica operations are <strong>serialised</strong>: a call against
+ * a given replica handle is observed atomically with respect to any
+ * concurrent call against the same handle from another thread. Operations
+ * on <strong>different replica handles proceed concurrently</strong>; one
+ * replica's work never blocks another's.
+ *
+ * <p>Replica handles (the {@code long} returned by {@link #nativeInitialize})
+ * may be shared across threads.
+ *
+ * <h3>Sync and the per-replica lock</h3>
+ * <p>The sync methods ({@code nativeSyncGcp}, {@code nativeSyncAwsAccessKey},
+ * {@code nativeSyncAwsProfile}, {@code nativeSyncAwsDefault}) hold the
+ * per-replica mutex for the full network round-trip — typically a few
+ * seconds, longer on flaky connections. While a sync is in progress on a
+ * given replica handle, all other operations against that handle queue.
+ *
+ * <p>For ANR-sensitive consumers, the recommended pattern is to open a
+ * <strong>second replica handle</strong> against the same data directory
+ * dedicated to sync work. The two handles have independent mutexes, so
+ * UI reads against the primary handle proceed regardless of sync activity.
+ * The underlying SQLite database uses WAL journalling and serialises
+ * concurrent writes safely.
+ *
+ * <pre>
+ * long uiReplica   = nativeInitialize(dataDir);  // user-facing operations
+ * long syncReplica = nativeInitialize(dataDir);  // background sync only
+ *
+ * // On a background thread:
+ * nativeSyncGcp(syncReplica, bucket, credPath, secret);
+ *
+ * // Concurrently, on a different background thread:
+ * String[] uuids = nativeGetAllTaskUuids(uiReplica);
+ *
+ * // After sync completes, optionally refresh the UI replica's
+ * // working-set index so newly-merged tasks have indices:
+ * nativeRebuildWorkingSet(uiReplica, true);
+ * </pre>
+ *
+ * <p>Both handles must be destroyed via {@link #nativeDestroy} when no
+ * longer needed.
+ *
+ * <h2>Error reporting</h2>
+ * <p>Failures are reported as unchecked exceptions in the
+ * {@link TaskChampionException} hierarchy. Errors are never silently
+ * dropped. The full hierarchy:
+ * <ul>
+ *   <li>{@link InvalidReplicaException} — null or unregistered handle</li>
+ *   <li>{@link InvalidUuidException} — UUID could not be parsed</li>
+ *   <li>{@link InvalidStatusException} — status string not in
+ *       {@code pending}, {@code completed}, {@code deleted}</li>
+ *   <li>{@link InvalidTagException} — tag string failed
+ *       TaskChampion's tag-name validation</li>
+ *   <li>{@link ReplicaInitializationException} — storage could not be
+ *       opened or created</li>
+ *   <li>{@link SyncException} — synchronisation failed (invalid config,
+ *       transport error, TLS panic, etc.)</li>
+ *   <li>{@link TaskChampionStorageException} — anything else from the
+ *       underlying library, including missing tasks on a write</li>
+ * </ul>
+ *
+ * <p>A few queries return {@code null} or an empty array to mean "no such
+ * value", which is a normal answer rather than a failure:
+ * {@link #nativeGetUuidForIndex} returns {@code null} when no task occupies
+ * the index, {@link #nativeGetTaskData} returns {@code null} when the task
+ * does not exist, {@link #nativeGetAllTaskUuids} returns an empty array
+ * when there are no tasks, and {@link #nativeUndo} returns {@code false}
+ * when there is nothing to undo.
+ *
+ * <p>Rust panics in the underlying library are caught at every native
+ * entry point and re-thrown as {@link TaskChampionException}; they will
+ * not crash the JVM.
  */
 public class TaskChampionJniImpl {
     
@@ -44,17 +124,27 @@ public class TaskChampionJniImpl {
     public static native boolean nativeUndo(long replicaPtr);
     
     /**
-     * Add an undo point for transaction grouping
+     * Add an undo point. The next undo will reverse all operations
+     * recorded after this point.
      * @param replicaPtr Pointer to the replica
-     * @param message Description of the undo point
      */
-    public static native void nativeAddUndoPoint(long replicaPtr, String message);
+    public static native void nativeAddUndoPoint(long replicaPtr);
     
     /**
-     * Commit all pending operations and rebuild working set
+     * Rebuild the working set so that 1-based pending-task indices reflect
+     * current task state. Equivalent to TaskChampion's
+     * {@code Replica::rebuild_working_set}. Individual write operations
+     * commit to the operation journal automatically; this method does
+     * <em>not</em> commit pending changes (there are none) but does refresh
+     * the index used by {@link #nativeGetUuidForIndex}.
+     *
      * @param replicaPtr Pointer to the replica
+     * @param renumber if {@code true}, reassign 1-based indices to all
+     *                 currently-pending tasks (matching the TaskWarrior
+     *                 default after a sync); if {@code false}, retain
+     *                 existing indices where possible
      */
-    public static native void nativeCommit(long replicaPtr);
+    public static native void nativeRebuildWorkingSet(long replicaPtr, boolean renumber);
     
     // Task creation and basic operations
     
@@ -151,24 +241,89 @@ public class TaskChampionJniImpl {
      */
     public static native String nativeGetUuidForIndex(long replicaPtr, int index);
     
-    // Task Management
-    
-    /**
-     * Clear all tasks from the replica by setting them to deleted status.
-     * This is useful for switching sync profiles without affecting server data.
-     * 
-     * @param replicaPtr Pointer to the replica
-     * @return true if clearing was successful
-     */
-    public static native boolean nativeClearAllTasks(long replicaPtr);
-    
     // Synchronization
     
     /**
-     * Synchronize with remote server
+     * Synchronise with a Google Cloud Storage bucket.
+     *
      * @param replicaPtr Pointer to the replica
-     * @param serverConfigJson JSON configuration for server
-     * @return "SUCCESS" or error message
+     * @param bucket Name of the GCS bucket
+     * @param credentialPath Path to a service-account JSON key file, or
+     *                       {@code null} to use ambient credentials
+     * @param encryptionSecret Secret used to encrypt the synced payload
+     *                         at rest in the bucket; must be non-empty
+     * @throws SyncException on any synchronisation failure (including
+     *                       invalid configuration and TLS panics)
+     * @throws InvalidReplicaException if replicaPtr is null or unregistered
      */
-    public static native String nativeSync(long replicaPtr, String serverConfigJson);
+    public static native void nativeSyncGcp(
+        long replicaPtr,
+        String bucket,
+        String credentialPath,
+        String encryptionSecret
+    );
+
+    /**
+     * Synchronise with an AWS S3-compatible bucket using an explicit
+     * access-key credential pair.
+     *
+     * @param replicaPtr Pointer to the replica
+     * @param region AWS region (e.g. "us-east-1")
+     * @param bucket Name of the S3 bucket
+     * @param accessKeyId AWS access key ID
+     * @param secretAccessKey AWS secret access key
+     * @param encryptionSecret Secret used to encrypt the synced payload;
+     *                         must be non-empty
+     * @throws SyncException on any synchronisation failure
+     * @throws InvalidReplicaException if replicaPtr is null or unregistered
+     */
+    public static native void nativeSyncAwsAccessKey(
+        long replicaPtr,
+        String region,
+        String bucket,
+        String accessKeyId,
+        String secretAccessKey,
+        String encryptionSecret
+    );
+
+    /**
+     * Synchronise with an AWS S3-compatible bucket using a named
+     * credential profile from the host's AWS config.
+     *
+     * @param replicaPtr Pointer to the replica
+     * @param region AWS region
+     * @param bucket Name of the S3 bucket
+     * @param profileName Name of the AWS profile to use
+     * @param encryptionSecret Secret used to encrypt the synced payload;
+     *                         must be non-empty
+     * @throws SyncException on any synchronisation failure
+     * @throws InvalidReplicaException if replicaPtr is null or unregistered
+     */
+    public static native void nativeSyncAwsProfile(
+        long replicaPtr,
+        String region,
+        String bucket,
+        String profileName,
+        String encryptionSecret
+    );
+
+    /**
+     * Synchronise with an AWS S3-compatible bucket using the default
+     * AWS credential chain (environment variables, shared credentials
+     * file, EC2 instance metadata, etc.).
+     *
+     * @param replicaPtr Pointer to the replica
+     * @param region AWS region
+     * @param bucket Name of the S3 bucket
+     * @param encryptionSecret Secret used to encrypt the synced payload;
+     *                         must be non-empty
+     * @throws SyncException on any synchronisation failure
+     * @throws InvalidReplicaException if replicaPtr is null or unregistered
+     */
+    public static native void nativeSyncAwsDefault(
+        long replicaPtr,
+        String region,
+        String bucket,
+        String encryptionSecret
+    );
 }

@@ -29,26 +29,161 @@ lazy_static! {
     static ref REPLICA_LOCKS: DashMap<jlong, Arc<Mutex<()>>> = DashMap::new();
 }
 
-// Macro to simplify replica lock acquisition
-macro_rules! with_replica_lock {
-    ($replica_ptr:expr, $method_name:expr, $return_value:expr, $code:block) => {
-        match REPLICA_LOCKS.get(&$replica_ptr) {
-            Some(lock_arc) => {
-                let _guard = match lock_arc.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        warn!("Replica mutex poisoned in {}, recovering", $method_name);
-                        poisoned.into_inner()
-                    }
-                };
-                $code
-            }
-            None => {
-                error!("Invalid replica pointer: {}", $replica_ptr);
-                $return_value
+// Fully-qualified names of the Java exception classes thrown by this binding.
+const EXC_BASE: &str = "com/tasksquire/data/storage/TaskChampionException";
+const EXC_INVALID_REPLICA: &str = "com/tasksquire/data/storage/InvalidReplicaException";
+const EXC_INVALID_UUID: &str = "com/tasksquire/data/storage/InvalidUuidException";
+const EXC_INVALID_STATUS: &str = "com/tasksquire/data/storage/InvalidStatusException";
+const EXC_INVALID_TAG: &str = "com/tasksquire/data/storage/InvalidTagException";
+const EXC_REPLICA_INIT: &str = "com/tasksquire/data/storage/ReplicaInitializationException";
+const EXC_SYNC: &str = "com/tasksquire/data/storage/SyncException";
+const EXC_STORAGE: &str = "com/tasksquire/data/storage/TaskChampionStorageException";
+
+/// Best-effort extraction of a human-readable string from a panic payload.
+fn panic_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<panic with non-string payload>".to_string()
+    }
+}
+
+/// Wrap a JNI entry-point body in `panic::catch_unwind` so a Rust panic
+/// never crosses the FFI boundary into the JVM. On panic, throws
+/// TaskChampionException with the panic message and returns the supplied
+/// default sentinel.
+macro_rules! catch_panics {
+    ($env:expr, $method:expr, $default:expr, $body:block) => {{
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { $body }));
+        match panic_result {
+            Ok(value) => value,
+            Err(payload) => {
+                let msg = panic_msg(&payload);
+                error!("Panic in {}: {}", $method, msg);
+                throw($env, EXC_BASE, &format!("Internal panic in {}: {}", $method, msg));
+                $default
             }
         }
+    }};
+}
+
+/// Throw a Java exception of the given class with the given message.
+/// If a JVM exception is already pending, this is a no-op so that the
+/// original exception is preserved. Failures to throw are logged.
+fn throw<'local>(env: &mut JNIEnv<'local>, class: &str, msg: &str) {
+    if env.exception_check().unwrap_or(false) {
+        return;
+    }
+    if let Err(e) = env.throw_new(class, msg) {
+        error!("Failed to throw {}: {:?}", class, e);
+    }
+}
+
+/// Read a JString parameter into a Rust String. Throws
+/// TaskChampionStorageException on JNI marshalling failure (rare).
+fn read_jstring<'local, 's>(
+    env: &mut JNIEnv<'local>,
+    jstr: &JString<'s>,
+    param_name: &str,
+) -> Option<String> {
+    match env.get_string(jstr) {
+        Ok(s) => Some(s.into()),
+        Err(e) => {
+            error!("Failed to read JNI string parameter '{}': {:?}", param_name, e);
+            throw(
+                env,
+                EXC_STORAGE,
+                &format!("Failed to read parameter '{}' from JVM: {}", param_name, e),
+            );
+            None
+        }
+    }
+}
+
+/// Parse a string as a v4 UUID. Throws InvalidUuidException on failure.
+fn parse_uuid(env: &mut JNIEnv, uuid_str: &str) -> Option<Uuid> {
+    match Uuid::parse_str(uuid_str) {
+        Ok(u) => Some(u),
+        Err(e) => {
+            throw(
+                env,
+                EXC_INVALID_UUID,
+                &format!("Invalid UUID '{}': {}", uuid_str, e),
+            );
+            None
+        }
+    }
+}
+
+/// Acquire the per-replica mutex and run a closure with exclusive access
+/// to the replica. The lock is released before this function returns.
+///
+/// Behaviour:
+/// - If `replica_ptr` is null or no longer registered, throws
+///   InvalidReplicaException and returns `default` (the JVM observes
+///   the exception and ignores the return value).
+/// - If the closure returns `Err(msg)`, throws TaskChampionStorageException
+///   with that message and returns `default`.
+/// - If the closure returns `Ok(value)`, returns `value`.
+///
+/// All JNI marshalling of inputs and outputs should happen outside this
+/// function so the lock is held only for the replica work itself.
+fn run_with_replica<'local, F, R>(
+    env: &mut JNIEnv<'local>,
+    replica_ptr: jlong,
+    method_name: &str,
+    default: R,
+    f: F,
+) -> R
+where
+    F: FnOnce(&mut Replica) -> Result<R, String>,
+{
+    if replica_ptr == 0 {
+        throw(
+            env,
+            EXC_INVALID_REPLICA,
+            &format!("Null replica pointer in {}", method_name),
+        );
+        return default;
+    }
+
+    let lock_arc = match REPLICA_LOCKS.get(&replica_ptr) {
+        Some(entry) => entry.clone(),
+        None => {
+            throw(
+                env,
+                EXC_INVALID_REPLICA,
+                &format!(
+                    "Invalid replica pointer in {} (not registered or already destroyed)",
+                    method_name
+                ),
+            );
+            return default;
+        }
     };
+
+    let result = {
+        let _guard = match lock_arc.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Replica mutex poisoned in {}, recovering", method_name);
+                poisoned.into_inner()
+            }
+        };
+        let replica = unsafe { &mut *(replica_ptr as *mut Replica) };
+        f(replica)
+    };
+
+    match result {
+        Ok(value) => value,
+        Err(msg) => {
+            error!("{}", msg);
+            throw(env, EXC_STORAGE, &msg);
+            default
+        }
+    }
 }
 
 
@@ -115,118 +250,114 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     _class: JClass,
     data_dir: JString<'local>,
 ) -> jlong {
-    // Initialize Android logger
     init_android_logger();
-    
-    // Configure TLS for Android compatibility
     configure_android_tls();
-    
-    let data_dir_str: String = match env.get_string(&data_dir) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get data_dir string: {:?}", e);
-            return 0;
-        }
-    };
 
-    info!("Initializing Replica with data directory: {}", data_dir_str);
+    catch_panics!(&mut env, "nativeInitialize", 0, {
+        let data_dir_str = match read_jstring(&mut env, &data_dir, "data_dir") {
+            Some(s) => s,
+            None => return 0,
+        };
 
-    let storage_config = StorageConfig::OnDisk {
-        taskdb_dir: data_dir_str.into(),
-        create_if_missing: true,
-        access_mode: taskchampion::storage::AccessMode::ReadWrite,
-    };
+        info!("Initializing Replica with data directory: {}", data_dir_str);
 
-    let storage = match storage_config.into_storage() {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create storage: {:?}", e);
-            return 0;
-        }
-    };
+        let storage_config = StorageConfig::OnDisk {
+            taskdb_dir: data_dir_str.into(),
+            create_if_missing: true,
+            access_mode: taskchampion::storage::AccessMode::ReadWrite,
+        };
 
-    let replica = Replica::new(storage);
-    let boxed_replica = Box::new(replica);
-    let replica_ptr = Box::into_raw(boxed_replica) as jlong;
+        let storage = match storage_config.into_storage() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to create storage: {:?}", e);
+                throw(&mut env, EXC_REPLICA_INIT, &format!("Failed to create storage: {}", e));
+                return 0;
+            }
+        };
 
-    // Register per-replica mutex for thread safety
-    REPLICA_LOCKS.insert(replica_ptr, Arc::new(Mutex::new(())));
+        let replica = Replica::new(storage);
+        let boxed_replica = Box::new(replica);
+        let replica_ptr = Box::into_raw(boxed_replica) as jlong;
+        REPLICA_LOCKS.insert(replica_ptr, Arc::new(Mutex::new(())));
 
-    info!("Replica initialized successfully, pointer: {}", replica_ptr);
-    replica_ptr
+        info!("Replica initialized successfully, pointer: {}", replica_ptr);
+        replica_ptr
+    })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeDestroy(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     replica_ptr: jlong,
 ) {
-    if replica_ptr == 0 {
-        error!("Attempted to destroy null replica pointer");
-        return;
-    }
+    catch_panics!(&mut env, "nativeDestroy", (), {
+        if replica_ptr == 0 {
+            throw(&mut env, EXC_INVALID_REPLICA, "Cannot destroy a null replica pointer");
+            return;
+        }
 
-    info!("Destroying Replica with pointer: {}", replica_ptr);
+        info!("Destroying Replica with pointer: {}", replica_ptr);
 
-    // Remove the mutex from registry
-    if let Some((_, _)) = REPLICA_LOCKS.remove(&replica_ptr) {
-        info!("Replica mutex cleaned up");
-    } else {
-        warn!("No mutex found for replica: {}", replica_ptr);
-    }
+        if REPLICA_LOCKS.remove(&replica_ptr).is_none() {
+            throw(
+                &mut env,
+                EXC_INVALID_REPLICA,
+                &format!("Replica pointer {} is not registered (already destroyed?)", replica_ptr),
+            );
+            return;
+        }
 
-    unsafe {
-        let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
-        drop(boxed_replica);
-        info!("Replica destroyed successfully");
-    }
+        unsafe {
+            let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
+            drop(boxed_replica);
+            info!("Replica destroyed successfully");
+        }
+    })
 }
 
 // Transaction control
 
 #[no_mangle]
 pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeUndo(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     replica_ptr: jlong,
 ) -> jboolean {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeUndo");
-        return 0;
-    }
+    catch_panics!(&mut env, "nativeUndo", 0, {
+        enum UndoOutcome {
+            NoOpsToUndo,
+            Reversed,
+            ConcurrentChanges,
+        }
 
-    with_replica_lock!(replica_ptr, "nativeUndo", 0, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-        match replica.get_undo_operations() {
-                Ok(undo_ops) => {
-                    if undo_ops.is_empty() {
-                        info!("No operations to undo");
-                        return 0;
-                    }
-                    
-                    match replica.commit_reversed_operations(undo_ops) {
-                        Ok(success) => {
-                            if success {
-                                info!("Undo operation completed successfully");
-                                1
-                            } else {
-                                warn!("Undo operation failed - concurrent changes detected");
-                                0
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to commit undo operations: {:?}", e);
-                            0
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get undo operations: {:?}", e);
-                    0
-                }
+        let outcome = run_with_replica(&mut env, replica_ptr, "nativeUndo", UndoOutcome::NoOpsToUndo, |replica| {
+            let undo_ops = replica
+                .get_undo_operations()
+                .map_err(|e| format!("Failed to get undo operations: {}", e))?;
+            if undo_ops.is_empty() {
+                return Ok(UndoOutcome::NoOpsToUndo);
+            }
+            match replica.commit_reversed_operations(undo_ops) {
+                Ok(true) => Ok(UndoOutcome::Reversed),
+                Ok(false) => Ok(UndoOutcome::ConcurrentChanges),
+                Err(e) => Err(format!("Failed to commit undo operations: {}", e)),
+            }
+        });
+
+        match outcome {
+            UndoOutcome::Reversed => {
+                info!("Undo operation completed successfully");
+                1
+            }
+            UndoOutcome::NoOpsToUndo => {
+                info!("No operations to undo");
+                0
+            }
+            UndoOutcome::ConcurrentChanges => {
+                warn!("Undo operation failed - concurrent changes detected");
+                0
             }
         }
     })
@@ -237,66 +368,36 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     mut env: JNIEnv,
     _class: JClass,
     replica_ptr: jlong,
-    message: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeAddUndoPoint");
-        return;
-    }
-
-    let message_str: String = match env.get_string(&message) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get message string: {:?}", e);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeAddUndoPoint", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
+    catch_panics!(&mut env, "nativeAddUndoPoint", (), {
+        run_with_replica(&mut env, replica_ptr, "nativeAddUndoPoint", (), |replica| {
             let mut ops = Operations::new();
-            
-            // Add an undo point operation
             ops.push(Operation::UndoPoint);
-            
-            match replica.commit_operations(ops) {
-                Ok(_) => {
-                    info!("Undo point added: {}", message_str);
-                }
-                Err(e) => {
-                    error!("Failed to add undo point: {:?}", e);
-                }
-            }
-        }
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to add undo point: {}", e))?;
+            info!("Undo point added");
+            Ok(())
+        });
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeCommit(
-    _env: JNIEnv,
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeRebuildWorkingSet(
+    mut env: JNIEnv,
     _class: JClass,
     replica_ptr: jlong,
+    renumber: jboolean,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeCommit");
-        return;
-    }
-
-    with_replica_lock!(replica_ptr, "nativeCommit", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-            // Force a rebuild of the working set to ensure consistency
-            match replica.rebuild_working_set(true) {
-                Ok(_) => {
-                    info!("Commit completed - working set rebuilt");
-                }
-                Err(e) => {
-                    error!("Failed to rebuild working set during commit: {:?}", e);
-                }
-            }
-        }
+    catch_panics!(&mut env, "nativeRebuildWorkingSet", (), {
+        let renumber = renumber != 0;
+        run_with_replica(&mut env, replica_ptr, "nativeRebuildWorkingSet", (), |replica| {
+            replica
+                .rebuild_working_set(renumber)
+                .map_err(|e| format!("Failed to rebuild working set: {}", e))?;
+            info!("Working set rebuilt (renumber={})", renumber);
+            Ok(())
+        });
     })
 }
 
@@ -309,56 +410,27 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     replica_ptr: jlong,
     uuid: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeCreateTask");
-        return;
-    }
+    catch_panics!(&mut env, "nativeCreateTask", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeCreateTask", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-        let mut ops = Operations::new();
-            
-        match replica.create_task(task_uuid, &mut ops) {
-                Ok(mut task) => {
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("entry", Some(now_timestamp.clone()), &mut ops) {
-                        error!("Failed to set entry timestamp: {:?}", e);
-                        return;
-                    }
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit create task operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Task created successfully: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to create task: {:?}", e);
-                }
-            }
-        }
+        run_with_replica(&mut env, replica_ptr, "nativeCreateTask", (), |replica| {
+            let mut ops = Operations::new();
+            let mut task = replica
+                .create_task(task_uuid, &mut ops)
+                .map_err(|e| format!("Failed to create task: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("entry", Some(now.clone()), &mut ops)
+                .map_err(|e| format!("Failed to set entry timestamp: {}", e))?;
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit create task operations: {}", e))?;
+            info!("Task created successfully: {}", uuid_str);
+            Ok(())
+        });
     })
 }
 
@@ -370,68 +442,29 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     uuid: JString,
     desc: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskSetDescription");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskSetDescription", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
+        let description = match read_jstring(&mut env, &desc, "description") { Some(s) => s, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    let description: String = match env.get_string(&desc) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get description string: {:?}", e);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskSetDescription", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
+        run_with_replica(&mut env, replica_ptr, "nativeTaskSetDescription", (), |replica| {
             let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    if let Err(e) = task.set_description(description, &mut ops) {
-                        error!("Failed to set task description: {:?}", e);
-                        return;
-                    }
-                    
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit set description operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Task description updated successfully: {}", uuid_str);
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
-            }
-        }
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            task.set_description(description, &mut ops)
+                .map_err(|e| format!("Failed to set task description: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit set description operations: {}", e))?;
+            info!("Task description updated successfully: {}", uuid_str);
+            Ok(())
+        });
     })
 }
 
@@ -443,78 +476,43 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     uuid: JString,
     status: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskSetStatus");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskSetStatus", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
+        let status_str = match read_jstring(&mut env, &status, "status") { Some(s) => s, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    let status_str: String = match env.get_string(&status) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get status string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_status = match status_str.as_str() {
-        "pending" => Status::Pending,
-        "completed" => Status::Completed,
-        "deleted" => Status::Deleted,
-        _ => {
-            error!("Invalid status value: {}", status_str);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskSetStatus", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    if let Err(e) = task.set_status(task_status, &mut ops) {
-                        error!("Failed to set task status: {:?}", e);
-                        return;
-                    }
-                    
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit set status operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Task status updated successfully: {} -> {}", uuid_str, status_str);
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
+        let task_status = match status_str.as_str() {
+            "pending" => Status::Pending,
+            "completed" => Status::Completed,
+            "deleted" => Status::Deleted,
+            _ => {
+                throw(
+                    &mut env,
+                    EXC_INVALID_STATUS,
+                    &format!("Invalid status '{}'; expected one of: pending, completed, deleted", status_str),
+                );
+                return;
             }
-        }
+        };
+
+        run_with_replica(&mut env, replica_ptr, "nativeTaskSetStatus", (), |replica| {
+            let mut ops = Operations::new();
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            task.set_status(task_status, &mut ops)
+                .map_err(|e| format!("Failed to set task status: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit set status operations: {}", e))?;
+            info!("Task status updated successfully: {} -> {}", uuid_str, status_str);
+            Ok(())
+        });
     })
 }
 
@@ -529,84 +527,45 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     key: JString,
     value: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskSetValue");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskSetValue", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
+        let key_str = match read_jstring(&mut env, &key, "key") { Some(s) => s, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
+        let value_opt: Option<String> = if value.is_null() {
+            None
+        } else {
+            match read_jstring(&mut env, &value, "value") { Some(s) => Some(s), None => return }
+        };
 
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
+        let value_present = value_opt.is_some();
+        let key_for_log = key_str.clone();
 
-    let key_str: String = match env.get_string(&key) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get key string: {:?}", e);
-            return;
-        }
-    };
-
-    // Check if value is null (nullable parameter)
-    let value_opt = if value.is_null() {
-        None
-    } else {
-        match env.get_string(&value) {
-            Ok(s) => Some(s.into()),
-            Err(e) => {
-                error!("Failed to get value string: {:?}", e);
-                return;
-            }
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskSetValue", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
+        run_with_replica(&mut env, replica_ptr, "nativeTaskSetValue", (), |replica| {
             let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    if let Err(e) = task.set_value(&key_str, value_opt, &mut ops) {
-                        error!("Failed to set task value: {:?}", e);
-                        return;
-                    }
-                    
-                    if key_str != "modified" {
-                        let now_timestamp = Utc::now().timestamp().to_string();
-                        if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                            error!("Failed to set modified timestamp: {:?}", e);
-                            return;
-                        }
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit set value operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Task value updated successfully: {} -> {}={:?}", uuid_str, key_str, 
-                          if value.is_null() { "None" } else { "Some(_)" });
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            task.set_value(&key_str, value_opt, &mut ops)
+                .map_err(|e| format!("Failed to set task value: {}", e))?;
+            if key_str != "modified" {
+                let now = Utc::now().timestamp().to_string();
+                task.set_value("modified", Some(now), &mut ops)
+                    .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
             }
-        }
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit set value operations: {}", e))?;
+            info!(
+                "Task value updated successfully: {} -> {}={}",
+                uuid_str,
+                key_for_log,
+                if value_present { "Some(_)" } else { "None" }
+            );
+            Ok(())
+        });
     })
 }
 
@@ -618,76 +577,37 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     uuid: JString,
     tag: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskAddTag");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskAddTag", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
+        let tag_str = match read_jstring(&mut env, &tag, "tag") { Some(s) => s, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    let tag_str: String = match env.get_string(&tag) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get tag string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_tag = match Tag::try_from(tag_str.as_str()) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Invalid tag format: {:?}", e);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskAddTag", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    if let Err(e) = task.add_tag(&task_tag, &mut ops) {
-                        error!("Failed to add tag to task: {:?}", e);
-                        return;
-                    }
-                    
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit add tag operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Tag added successfully: {} -> {}", uuid_str, tag_str);
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
+        let task_tag = match Tag::try_from(tag_str.as_str()) {
+            Ok(t) => t,
+            Err(e) => {
+                throw(&mut env, EXC_INVALID_TAG, &format!("Invalid tag '{}': {}", tag_str, e));
+                return;
             }
-        }
+        };
+
+        run_with_replica(&mut env, replica_ptr, "nativeTaskAddTag", (), |replica| {
+            let mut ops = Operations::new();
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            task.add_tag(&task_tag, &mut ops)
+                .map_err(|e| format!("Failed to add tag to task: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit add tag operations: {}", e))?;
+            info!("Tag added successfully: {} -> {}", uuid_str, tag_str);
+            Ok(())
+        });
     })
 }
 
@@ -699,76 +619,37 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     uuid: JString,
     tag: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskRemoveTag");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskRemoveTag", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
+        let tag_str = match read_jstring(&mut env, &tag, "tag") { Some(s) => s, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    let tag_str: String = match env.get_string(&tag) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get tag string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_tag = match Tag::try_from(tag_str.as_str()) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Invalid tag format: {:?}", e);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskRemoveTag", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    if let Err(e) = task.remove_tag(&task_tag, &mut ops) {
-                        error!("Failed to remove tag from task: {:?}", e);
-                        return;
-                    }
-                    
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit remove tag operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Tag removed successfully: {} -> {}", uuid_str, tag_str);
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
+        let task_tag = match Tag::try_from(tag_str.as_str()) {
+            Ok(t) => t,
+            Err(e) => {
+                throw(&mut env, EXC_INVALID_TAG, &format!("Invalid tag '{}': {}", tag_str, e));
+                return;
             }
-        }
+        };
+
+        run_with_replica(&mut env, replica_ptr, "nativeTaskRemoveTag", (), |replica| {
+            let mut ops = Operations::new();
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            task.remove_tag(&task_tag, &mut ops)
+                .map_err(|e| format!("Failed to remove tag from task: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit remove tag operations: {}", e))?;
+            info!("Tag removed successfully: {} -> {}", uuid_str, tag_str);
+            Ok(())
+        });
     })
 }
 
@@ -782,73 +663,33 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     uuid: JString,
     desc: JString,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskAddAnnotation");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskAddAnnotation", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
+        let description = match read_jstring(&mut env, &desc, "description") { Some(s) => s, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    let description: String = match env.get_string(&desc) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get description string: {:?}", e);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskAddAnnotation", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
+        run_with_replica(&mut env, replica_ptr, "nativeTaskAddAnnotation", (), |replica| {
             let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    let annotation = Annotation {
-                        entry: Utc::now(),
-                        description,
-                    };
-                    
-                    if let Err(e) = task.add_annotation(annotation, &mut ops) {
-                        error!("Failed to add annotation to task: {:?}", e);
-                        return;
-                    }
-                    
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit add annotation operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Annotation added successfully to task: {}", uuid_str);
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
-            }
-        }
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            let annotation = Annotation {
+                entry: Utc::now(),
+                description,
+            };
+            task.add_annotation(annotation, &mut ops)
+                .map_err(|e| format!("Failed to add annotation to task: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit add annotation operations: {}", e))?;
+            info!("Annotation added successfully to task: {}", uuid_str);
+            Ok(())
+        });
     })
 }
 
@@ -860,68 +701,40 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     uuid: JString,
     entry_timestamp: jlong,
 ) {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeTaskRemoveAnnotation");
-        return;
-    }
+    catch_panics!(&mut env, "nativeTaskRemoveAnnotation", (), {
+        let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
+        let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return;
-        }
-    };
-
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return;
-        }
-    };
-
-    let entry_time = match chrono::DateTime::from_timestamp(entry_timestamp, 0) {
-        Some(dt) => dt,
-        None => {
-            error!("Invalid timestamp: {}", entry_timestamp);
-            return;
-        }
-    };
-
-    with_replica_lock!(replica_ptr, "nativeTaskRemoveAnnotation", return, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            let mut ops = Operations::new();
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(mut task)) => {
-                    if let Err(e) = task.remove_annotation(entry_time, &mut ops) {
-                        error!("Failed to remove annotation from task: {:?}", e);
-                        return;
-                    }
-                    
-                    let now_timestamp = Utc::now().timestamp().to_string();
-                    if let Err(e) = task.set_value("modified", Some(now_timestamp), &mut ops) {
-                        error!("Failed to set modified timestamp: {:?}", e);
-                        return;
-                    }
-                    
-                    if let Err(e) = replica.commit_operations(ops) {
-                        error!("Failed to commit remove annotation operations: {:?}", e);
-                        return;
-                    }
-                    
-                    info!("Annotation removed successfully from task: {} at timestamp {}", uuid_str, entry_timestamp);
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                }
-                Err(e) => {
-                    error!("Failed to get task: {:?}", e);
-                }
+        let entry_time = match chrono::DateTime::from_timestamp(entry_timestamp, 0) {
+            Some(dt) => dt,
+            None => {
+                throw(
+                    &mut env,
+                    "java/lang/IllegalArgumentException",
+                    &format!("Invalid annotation entry timestamp: {}", entry_timestamp),
+                );
+                return;
             }
-        }
+        };
+
+        run_with_replica(&mut env, replica_ptr, "nativeTaskRemoveAnnotation", (), |replica| {
+            let mut ops = Operations::new();
+            let mut task = replica
+                .get_task(task_uuid)
+                .map_err(|e| format!("Failed to get task: {}", e))?
+                .ok_or_else(|| format!("Task not found: {}", uuid_str))?;
+            task.remove_annotation(entry_time, &mut ops)
+                .map_err(|e| format!("Failed to remove annotation from task: {}", e))?;
+            let now = Utc::now().timestamp().to_string();
+            task.set_value("modified", Some(now), &mut ops)
+                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
+            drop(task);
+            replica
+                .commit_operations(ops)
+                .map_err(|e| format!("Failed to commit remove annotation operations: {}", e))?;
+            info!("Annotation removed successfully from task: {} at timestamp {}", uuid_str, entry_timestamp);
+            Ok(())
+        });
     })
 }
 
@@ -933,28 +746,16 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     _class: JClass,
     replica_ptr: jlong,
 ) -> jobjectArray {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeGetAllTaskUuids");
-        return create_empty_string_array(&mut env);
-    }
+    catch_panics!(&mut env, "nativeGetAllTaskUuids", std::ptr::null_mut(), {
+        let task_uuids = run_with_replica(&mut env, replica_ptr, "nativeGetAllTaskUuids", Vec::<String>::new(), |replica| {
+            let tasks = replica
+                .all_tasks()
+                .map_err(|e| format!("Failed to get all tasks: {}", e))?;
+            info!("Found {} task UUIDs", tasks.len());
+            Ok(tasks.keys().map(|uuid| uuid.to_string()).collect())
+        });
 
-    with_replica_lock!(replica_ptr, "nativeGetAllTaskUuids", create_empty_string_array(&mut env), {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-            let task_uuids: Vec<String> = match replica.all_tasks() {
-                Ok(tasks) => {
-                    info!("Found {} task UUIDs", tasks.len());
-                    tasks.keys().map(|uuid| uuid.to_string()).collect()
-                }
-                Err(e) => {
-                    error!("Failed to get all tasks: {:?}", e);
-                    return create_empty_string_array(&mut env);
-                }
-            };
-            
-            create_string_array(&mut env, task_uuids)
-        }
+        create_string_array(&mut env, task_uuids)
     })
 }
 
@@ -965,477 +766,306 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     replica_ptr: jlong,
     uuid: JString,
 ) -> JString<'local> {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeGetTaskData");
-        return JObject::null().into();
-    }
+    catch_panics!(&mut env, "nativeGetTaskData", JObject::null().into(), {
+    let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return JObject::null().into() };
+    let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return JObject::null().into() };
 
-    let uuid_str: String = match env.get_string(&uuid) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get UUID string: {:?}", e);
-            return JObject::null().into();
-        }
-    };
+    // None signals "task not found" — returned to Java as null. Storage errors throw.
+    let json_result: Option<String> = run_with_replica(&mut env, replica_ptr, "nativeGetTaskData", None, |replica| {
+        let task = match replica
+            .get_task(task_uuid)
+            .map_err(|e| format!("Failed to get task: {}", e))?
+        {
+            Some(t) => t,
+            None => {
+                info!("Task not found: {}", uuid_str);
+                return Ok(None);
+            }
+        };
 
-    let task_uuid = match Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid UUID format: {:?}", e);
-            return JObject::null().into();
-        }
-    };
+        let mut task_map = std::collections::HashMap::new();
 
-    with_replica_lock!(replica_ptr, "nativeGetTaskData", JObject::null().into(), {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-            match replica.get_task(task_uuid) {
-                Ok(Some(task)) => {
-                    let mut task_map = std::collections::HashMap::new();
-                    
-                    // Get task data properties
-                    match replica.get_task_data(task_uuid) {
-                        Ok(Some(task_data)) => {
-                            // Convert task data to a map for JSON serialization
-                            for (key, value) in task_data.iter() {
-                                task_map.insert(key.clone(), value.clone());
-                            }
-                        }
-                        Ok(None) => {
-                            warn!("No task data found for: {}", uuid_str);
-                        }
-                        Err(e) => {
-                            error!("Failed to get task data: {:?}", e);
-                        }
-                    }
-                    
-                    // Add tags to the task data
-                    let tags: Vec<Tag> = task.get_tags().collect();
-                    if !tags.is_empty() {
-                        for (i, tag) in tags.iter().enumerate() {
-                            task_map.insert(format!("tag_{}", i), tag.to_string());
-                        }
-                    }
-                    
-                    // Add annotations to the task data
-                    let annotations: Vec<Annotation> = task.get_annotations().collect();
-                    if !annotations.is_empty() {
-                        for (i, annotation) in annotations.iter().enumerate() {
-                            task_map.insert(format!("annotation_{}_entry", i), annotation.entry.timestamp().to_string());
-                            task_map.insert(format!("annotation_{}_description", i), annotation.description.clone());
-                        }
-                    }
-                    
-                    // Add the UUID to the task data
-                    task_map.insert("uuid".to_string(), uuid_str.clone());
-                    
-                    match serde_json::to_string(&task_map) {
-                        Ok(json_string) => {
-                            match env.new_string(&json_string) {
-                                Ok(java_string) => {
-                                    info!("Retrieved task data for: {}", uuid_str);
-                                    java_string
-                                }
-                                Err(e) => {
-                                    error!("Failed to create Java string for task data: {:?}", e);
-                                    JObject::null().into()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize task data to JSON: {:?}", e);
-                            JObject::null().into()
-                        }
-                    }
-                }
-                Ok(None) => {
-                    warn!("Task not found: {}", uuid_str);
-                    match env.new_string("{}") {
-                        Ok(empty_json) => empty_json,
-                        Err(e) => {
-                            error!("Failed to create empty JSON string: {:?}", e);
-                            JObject::null().into()
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get task data: {:?}", e);
-                    JObject::null().into()
-                }
+        if let Some(task_data) = replica
+            .get_task_data(task_uuid)
+            .map_err(|e| format!("Failed to get task data: {}", e))?
+        {
+            for (key, value) in task_data.iter() {
+                task_map.insert(key.clone(), value.clone());
             }
         }
+
+        let tags: Vec<Tag> = task.get_tags().collect();
+        for (i, tag) in tags.iter().enumerate() {
+            task_map.insert(format!("tag_{}", i), tag.to_string());
+        }
+
+        let annotations: Vec<Annotation> = task.get_annotations().collect();
+        for (i, annotation) in annotations.iter().enumerate() {
+            task_map.insert(format!("annotation_{}_entry", i), annotation.entry.timestamp().to_string());
+            task_map.insert(format!("annotation_{}_description", i), annotation.description.clone());
+        }
+
+        task_map.insert("uuid".to_string(), uuid_str.clone());
+
+        let json = serde_json::to_string(&task_map)
+            .map_err(|e| format!("Failed to serialize task data to JSON: {}", e))?;
+        info!("Retrieved task data for: {}", uuid_str);
+        Ok(Some(json))
+    });
+
+    match json_result {
+        Some(json) => match env.new_string(&json) {
+            Ok(java_string) => java_string,
+            Err(e) => {
+                error!("Failed to create Java string for task data: {:?}", e);
+                throw(&mut env, EXC_STORAGE, &format!("Failed to marshal task data: {}", e));
+                JObject::null().into()
+            }
+        },
+        None => JObject::null().into(),
+    }
     })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeGetUuidForIndex<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass,
     replica_ptr: jlong,
     index: jint,
 ) -> JString<'local> {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeGetUuidForIndex");
-        return JObject::null().into();
-    }
+    catch_panics!(&mut env, "nativeGetUuidForIndex", JObject::null().into(), {
+    let uuid_string: Option<String> = run_with_replica(&mut env, replica_ptr, "nativeGetUuidForIndex", None, |replica| {
+        let working_set = replica
+            .working_set()
+            .map_err(|e| format!("Failed to get working set: {}", e))?;
+        // TaskWarrior IDs are 1-based, so subtract 1 for 0-based index.
+        let result = (index > 0 && (index as usize) <= working_set.len())
+            .then(|| working_set.by_index((index as usize) - 1))
+            .flatten()
+            .filter(|uuid| !uuid.is_nil())
+            .map(|uuid| uuid.to_string());
+        match result.as_ref() {
+            Some(s) => info!("Found UUID {} for index {}", s, index),
+            None => info!("No task found at index {}", index),
+        }
+        Ok(result)
+    });
 
-    with_replica_lock!(replica_ptr, "nativeGetUuidForIndex", JObject::null().into(), {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-            match replica.working_set() {
-                Ok(working_set) => {
-                    // TaskWarrior IDs are 1-based, so subtract 1 for 0-based index
-                    if index > 0 && (index as usize) <= working_set.len() {
-                        let zero_based_index = (index as usize) - 1;
-                        if let Some(uuid) = working_set.by_index(zero_based_index) {
-                            if !uuid.is_nil() {
-                                info!("Found UUID {} for index {}", uuid, index);
-                                match env.new_string(uuid.to_string()) {
-                                    Ok(jstr) => return jstr,
-                                    Err(e) => {
-                                        error!("Failed to create JString for UUID: {:?}", e);
-                                        return JObject::null().into();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    info!("No task found at index {}", index);
-                    JObject::null().into()
-                }
-                Err(e) => {
-                    error!("Failed to get working set: {:?}", e);
-                    JObject::null().into()
-                }
+    match uuid_string {
+        Some(s) => match env.new_string(s) {
+            Ok(jstr) => jstr,
+            Err(e) => {
+                error!("Failed to create JString for UUID: {:?}", e);
+                JObject::null().into()
             }
-        }
-    })
-}
-
-// Task Management
-
-#[no_mangle]
-pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeClearAllTasks(
-    _env: JNIEnv,
-    _class: JClass,
-    replica_ptr: jlong,
-) -> jboolean {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeClearAllTasks");
-        return 0;
+        },
+        None => JObject::null().into(),
     }
-
-    with_replica_lock!(replica_ptr, "nativeClearAllTasks", 0, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-            match clear_all_tasks_internal(replica) {
-                Ok(_) => {
-                    info!("All tasks cleared successfully");
-                    1
-                }
-                Err(e) => {
-                    error!("Failed to clear all tasks: {:?}", e);
-                    0
-                }
-            }
-        }
     })
-}
-
-fn clear_all_tasks_internal(replica: &mut Replica) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ops = Operations::new();
-    ops.push(Operation::UndoPoint);
-    
-    // Get all tasks and delete them
-    let all_tasks = replica.all_tasks()?;
-    let all_uuids: Vec<_> = all_tasks.keys().cloned().collect();
-    info!("Clearing {} tasks", all_uuids.len());
-    
-    for uuid in all_uuids {
-        if let Some(mut task) = replica.get_task(uuid)? {
-            task.set_status(Status::Deleted, &mut ops)?;
-        }
-    }
-    
-    replica.commit_operations(ops)?;
-    replica.rebuild_working_set(true)?;
-    
-    Ok(())
 }
 
 // Synchronization
 
-#[no_mangle]
-pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeSync<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass,
-    replica_ptr: jlong,
-    server_config_json: JString,
-) -> JString<'local> {
-    if replica_ptr == 0 {
-        error!("Null replica pointer passed to nativeSync");
-        return match env.new_string("ERROR: Null replica pointer") {
-            Ok(s) => s,
-            Err(_) => JObject::null().into(),
-        };
+/// Validate and convert a non-empty encryption secret string.
+fn parse_encryption_secret(env: &mut JNIEnv, secret: &str) -> Option<Vec<u8>> {
+    if secret.is_empty() {
+        throw(env, EXC_SYNC, "encryptionSecret must not be empty");
+        None
+    } else {
+        Some(secret.as_bytes().to_vec())
     }
+}
 
-    let server_config_str: String = match env.get_string(&server_config_json) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get server config JSON string: {:?}", e);
-            return match env.new_string("ERROR: Failed to get server config JSON") {
-                Ok(s) => s,
-                Err(_) => JObject::null().into(),
-            };
-        }
-    };
-
-    info!("Starting sync with config: {}", server_config_str);
-    
-    // Configure TLS for Android - force use of bundled certificates
+/// Run a sync against the supplied ServerConfig, translating any failure
+/// into a SyncException. Caller is responsible for translating its inputs
+/// into a ServerConfig and invoking this helper.
+fn do_sync(env: &mut JNIEnv, replica_ptr: jlong, method_name: &str, server_config: ServerConfig) {
+    info!("Starting sync via {}", method_name);
     configure_android_tls();
 
-    // Parse the JSON to extract server configuration
-    let server_config_data: serde_json::Value = match serde_json::from_str(&server_config_str) {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Failed to parse server config JSON: {:?}", e);
-            return match env.new_string(&format!("ERROR: Invalid JSON - {}", e)) {
+    enum SyncFailure {
+        ServerCreate(String),
+        Failed(String),
+        TlsPanic,
+    }
+
+    let result: Result<(), SyncFailure> = run_with_replica(
+        env,
+        replica_ptr,
+        method_name,
+        Err(SyncFailure::Failed("lock unavailable".to_string())),
+        |replica| {
+            let mut server = match server_config.into_server() {
                 Ok(s) => s,
-                Err(_) => JObject::null().into(),
-            };
-        }
-    };
-
-    // Determine server type and create appropriate configuration
-    let server_type = match server_config_data.get("type").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => {
-            error!("Missing 'type' field in server config");
-            return match env.new_string("ERROR: Missing 'type' field") {
-                Ok(s) => s,
-                Err(_) => JObject::null().into(),
-            };
-        }
-    };
-
-    let bucket = match server_config_data.get("bucket").and_then(|v| v.as_str()) {
-        Some(b) => b.to_string(),
-        None => {
-            error!("Missing 'bucket' field in server config");
-            return match env.new_string("ERROR: Missing 'bucket' field") {
-                Ok(s) => s,
-                Err(_) => JObject::null().into(),
-            };
-        }
-    };
-
-    let encryption_secret = match server_config_data.get("encryption_secret").and_then(|v| v.as_str()) {
-        Some(secret) => {
-            if secret.is_empty() {
-                error!("Encryption secret cannot be empty");
-                return match env.new_string("ERROR: Empty encryption secret") {
-                    Ok(s) => s,
-                    Err(_) => JObject::null().into(),
-                };
-            }
-            secret.as_bytes().to_vec()
-        }
-        None => {
-            error!("Missing 'encryption_secret' field in server config");
-            return match env.new_string("ERROR: Missing 'encryption_secret' field") {
-                Ok(s) => s,
-                Err(_) => JObject::null().into(),
-            };
-        }
-    };
-
-    // Create TaskChampion ServerConfig based on type
-    let server_config = match server_type {
-        "gcp" => {
-            let credential_path = server_config_data
-                .get("credential_path")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            ServerConfig::Gcp {
-                bucket,
-                credential_path,
-                encryption_secret,
-            }
-        }
-        "aws" => {
-            let region = match server_config_data.get("region").and_then(|v| v.as_str()) {
-                Some(r) => r.to_string(),
-                None => {
-                    error!("Missing 'region' field in AWS server config");
-                    return match env.new_string("ERROR: Missing 'region' field for AWS") {
-                        Ok(s) => s,
-                        Err(_) => JObject::null().into(),
-                    };
-                }
+                Err(e) => return Ok(Err(SyncFailure::ServerCreate(format!("{}", e)))),
             };
 
-            let credentials = match server_config_data.get("credentials") {
-                Some(cred_data) => {
-                    let cred_type = match cred_data.get("type").and_then(|v| v.as_str()) {
-                        Some(t) => t,
-                        None => {
-                            error!("Missing 'type' field in AWS credentials");
-                            return match env.new_string("ERROR: Missing 'type' field in AWS credentials") {
-                                Ok(s) => s,
-                                Err(_) => JObject::null().into(),
-                            };
-                        }
-                    };
+            let sync_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                replica.sync(&mut server, false)
+            }));
 
-                    match cred_type {
-                        "access_key" => {
-                            let access_key_id = match cred_data.get("access_key_id").and_then(|v| v.as_str()) {
-                                Some(id) => id.to_string(),
-                                None => {
-                                    error!("Missing 'access_key_id' field in AWS access key credentials");
-                                    return match env.new_string("ERROR: Missing 'access_key_id' field") {
-                                        Ok(s) => s,
-                                        Err(_) => JObject::null().into(),
-                                    };
-                                }
-                            };
-
-                            let secret_access_key = match cred_data.get("secret_access_key").and_then(|v| v.as_str()) {
-                                Some(key) => key.to_string(),
-                                None => {
-                                    error!("Missing 'secret_access_key' field in AWS access key credentials");
-                                    return match env.new_string("ERROR: Missing 'secret_access_key' field") {
-                                        Ok(s) => s,
-                                        Err(_) => JObject::null().into(),
-                                    };
-                                }
-                            };
-
-                            AwsCredentials::AccessKey {
-                                access_key_id,
-                                secret_access_key,
-                            }
-                        }
-                        "profile" => {
-                            let profile_name = match cred_data.get("profile_name").and_then(|v| v.as_str()) {
-                                Some(name) => name.to_string(),
-                                None => {
-                                    error!("Missing 'profile_name' field in AWS profile credentials");
-                                    return match env.new_string("ERROR: Missing 'profile_name' field") {
-                                        Ok(s) => s,
-                                        Err(_) => JObject::null().into(),
-                                    };
-                                }
-                            };
-
-                            AwsCredentials::Profile { profile_name }
-                        }
-                        "default" => AwsCredentials::Default,
-                        _ => {
-                            error!("Unknown AWS credential type: {}", cred_type);
-                            return match env.new_string(&format!("ERROR: Unknown AWS credential type: {}", cred_type)) {
-                                Ok(s) => s,
-                                Err(_) => JObject::null().into(),
-                            };
-                        }
+            match sync_result {
+                Ok(Ok(())) => {
+                    info!("Sync completed successfully");
+                    if let Err(e) = replica.rebuild_working_set(true) {
+                        error!("Failed to rebuild working set after sync: {:?}", e);
+                    } else {
+                        info!("Working set rebuilt after sync");
                     }
+                    Ok(Ok(()))
                 }
-                None => {
-                    error!("Missing 'credentials' field in AWS server config");
-                    return match env.new_string("ERROR: Missing 'credentials' field for AWS") {
-                        Ok(s) => s,
-                        Err(_) => JObject::null().into(),
-                    };
-                }
-            };
-
-            ServerConfig::Aws {
-                region,
-                bucket,
-                credentials,
-                encryption_secret,
-            }
-        }
-        _ => {
-            error!("Unknown server type: {}", server_type);
-            return match env.new_string(&format!("ERROR: Unknown server type: {}", server_type)) {
-                Ok(s) => s,
-                Err(_) => JObject::null().into(),
-            };
-        }
-    };
-
-    info!("Created server config, starting sync operation");
-
-    with_replica_lock!(replica_ptr, "nativeSync", match env.new_string("ERROR: Failed to acquire replica lock") { 
-        Ok(s) => s, 
-        Err(_) => JObject::null().into() 
-    }, {
-        unsafe {
-            let replica = &mut *(replica_ptr as *mut Replica);
-            
-            match server_config.into_server() {
-                Ok(mut server) => {
-                    // Wrap sync operation in panic handler to catch TLS certificate panics
-                    let sync_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        replica.sync(&mut server, false)
-                    }));
-                    
-                    match sync_result {
-                        Ok(sync_result) => match sync_result {
-                        Ok(()) => {
-                            info!("Sync completed successfully");
-                            
-                            // Rebuild working set to ensure all tasks are properly updated
-                            match replica.rebuild_working_set(true) {
-                                Ok(_) => {
-                                    info!("Working set rebuilt after sync");
-                                }
-                                Err(e) => {
-                                    error!("Failed to rebuild working set after sync: {:?}", e);
-                                }
-                            }
-                            
-                            match env.new_string("SUCCESS") {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    error!("Failed to create success string: {:?}", e);
-                                    JObject::null().into()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Sync failed: {:?}", e);
-                            match env.new_string(&format!("ERROR: Sync failed - {}", e)) {
-                                Ok(s) => s,
-                                Err(_) => JObject::null().into(),
-                            }
-                        }
-                        }
-                        Err(panic_err) => {
-                            error!("Sync operation panicked (likely TLS certificate issue): {:?}", panic_err);
-                            match env.new_string("ERROR: Sync failed due to TLS certificate issue on Android. This is a known limitation with AWS sync on Android.") {
-                                Ok(s) => s,
-                                Err(_) => JObject::null().into(),
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to create server from config: {:?}", e);
-                    match env.new_string(&format!("ERROR: Failed to create server - {}", e)) {
-                        Ok(s) => s,
-                        Err(_) => JObject::null().into(),
-                    }
+                Ok(Err(e)) => Ok(Err(SyncFailure::Failed(format!("{}", e)))),
+                Err(panic_err) => {
+                    error!("Sync operation panicked (likely TLS certificate issue): {:?}", panic_err);
+                    Ok(Err(SyncFailure::TlsPanic))
                 }
             }
+        },
+    );
+
+    match result {
+        Ok(()) => {}
+        Err(SyncFailure::ServerCreate(msg)) => {
+            throw(env, EXC_SYNC, &format!("Failed to create server: {}", msg));
         }
+        Err(SyncFailure::Failed(msg)) => {
+            throw(env, EXC_SYNC, &format!("Sync failed: {}", msg));
+        }
+        Err(SyncFailure::TlsPanic) => {
+            throw(
+                env,
+                EXC_SYNC,
+                "Sync failed due to a TLS-related panic in the underlying library (a known limitation with AWS sync on Android).",
+            );
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeSyncGcp(
+    mut env: JNIEnv,
+    _class: JClass,
+    replica_ptr: jlong,
+    bucket: JString,
+    credential_path: JString,
+    encryption_secret: JString,
+) {
+    catch_panics!(&mut env, "nativeSyncGcp", (), {
+        let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        let credential_path = if credential_path.is_null() {
+            None
+        } else {
+            match read_jstring(&mut env, &credential_path, "credentialPath") {
+                Some(s) => Some(s),
+                None => return,
+            }
+        };
+        let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") {
+            Some(s) => s,
+            None => return,
+        };
+        let encryption_secret = match parse_encryption_secret(&mut env, &encryption_secret_str) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let server_config = ServerConfig::Gcp {
+            bucket,
+            credential_path,
+            encryption_secret,
+        };
+        do_sync(&mut env, replica_ptr, "nativeSyncGcp", server_config);
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeSyncAwsAccessKey(
+    mut env: JNIEnv,
+    _class: JClass,
+    replica_ptr: jlong,
+    region: JString,
+    bucket: JString,
+    access_key_id: JString,
+    secret_access_key: JString,
+    encryption_secret: JString,
+) {
+    catch_panics!(&mut env, "nativeSyncAwsAccessKey", (), {
+        let region = match read_jstring(&mut env, &region, "region") { Some(s) => s, None => return };
+        let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        let access_key_id = match read_jstring(&mut env, &access_key_id, "accessKeyId") { Some(s) => s, None => return };
+        let secret_access_key = match read_jstring(&mut env, &secret_access_key, "secretAccessKey") { Some(s) => s, None => return };
+        let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") { Some(s) => s, None => return };
+        let encryption_secret = match parse_encryption_secret(&mut env, &encryption_secret_str) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let server_config = ServerConfig::Aws {
+            region,
+            bucket,
+            credentials: AwsCredentials::AccessKey { access_key_id, secret_access_key },
+            encryption_secret,
+        };
+        do_sync(&mut env, replica_ptr, "nativeSyncAwsAccessKey", server_config);
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeSyncAwsProfile(
+    mut env: JNIEnv,
+    _class: JClass,
+    replica_ptr: jlong,
+    region: JString,
+    bucket: JString,
+    profile_name: JString,
+    encryption_secret: JString,
+) {
+    catch_panics!(&mut env, "nativeSyncAwsProfile", (), {
+        let region = match read_jstring(&mut env, &region, "region") { Some(s) => s, None => return };
+        let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        let profile_name = match read_jstring(&mut env, &profile_name, "profileName") { Some(s) => s, None => return };
+        let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") { Some(s) => s, None => return };
+        let encryption_secret = match parse_encryption_secret(&mut env, &encryption_secret_str) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let server_config = ServerConfig::Aws {
+            region,
+            bucket,
+            credentials: AwsCredentials::Profile { profile_name },
+            encryption_secret,
+        };
+        do_sync(&mut env, replica_ptr, "nativeSyncAwsProfile", server_config);
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeSyncAwsDefault(
+    mut env: JNIEnv,
+    _class: JClass,
+    replica_ptr: jlong,
+    region: JString,
+    bucket: JString,
+    encryption_secret: JString,
+) {
+    catch_panics!(&mut env, "nativeSyncAwsDefault", (), {
+        let region = match read_jstring(&mut env, &region, "region") { Some(s) => s, None => return };
+        let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") { Some(s) => s, None => return };
+        let encryption_secret = match parse_encryption_secret(&mut env, &encryption_secret_str) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let server_config = ServerConfig::Aws {
+            region,
+            bucket,
+            credentials: AwsCredentials::Default,
+            encryption_secret,
+        };
+        do_sync(&mut env, replica_ptr, "nativeSyncAwsDefault", server_config);
     })
 }
 
@@ -1671,39 +1301,41 @@ mod tests {
             let replica_ptr_clone = replica_ptr;
             let handle = thread::spawn(move || {
                 for i in 0..tasks_per_thread {
-                    with_replica_lock!(replica_ptr_clone, "test_concurrent", (), {
-                        unsafe {
-                            let replica = &mut *(replica_ptr_clone as *mut Replica);
-                            let task_uuid = Uuid::new_v4();
-                            let mut ops = Operations::new();
-                            
-                            let mut task = replica.create_task(task_uuid, &mut ops)
-                                .expect("Failed to create task");
-                            
-                            task.set_description(format!("Thread {} Task {}", thread_id, i), &mut ops)
-                                .expect("Failed to set description");
-                            
-                            replica.commit_operations(ops)
-                                .expect("Failed to commit operations");
-                        }
-                    });
+                    let lock_arc = REPLICA_LOCKS.get(&replica_ptr_clone).unwrap().clone();
+                    let _guard = lock_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    unsafe {
+                        let replica = &mut *(replica_ptr_clone as *mut Replica);
+                        let task_uuid = Uuid::new_v4();
+                        let mut ops = Operations::new();
+
+                        let mut task = replica.create_task(task_uuid, &mut ops)
+                            .expect("Failed to create task");
+
+                        task.set_description(format!("Thread {} Task {}", thread_id, i), &mut ops)
+                            .expect("Failed to set description");
+
+                        replica.commit_operations(ops)
+                            .expect("Failed to commit operations");
+                    }
                 }
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().expect("Thread panicked");
         }
-        
+
         // Verify all tasks were created
-        with_replica_lock!(replica_ptr, "test_concurrent_verify", (), {
+        {
+            let lock_arc = REPLICA_LOCKS.get(&replica_ptr).unwrap().clone();
+            let _guard = lock_arc.lock().unwrap_or_else(|p| p.into_inner());
             unsafe {
                 let replica = &mut *(replica_ptr as *mut Replica);
                 let all_tasks = replica.all_tasks().expect("Failed to get all tasks");
                 assert_eq!(all_tasks.len(), num_threads * tasks_per_thread);
             }
-        });
+        }
         
         // Clean up
         REPLICA_LOCKS.remove(&replica_ptr);
@@ -1738,23 +1370,24 @@ mod tests {
         let _ = handle.join();
         
         // Now try to use the poisoned mutex - it should recover
-        with_replica_lock!(replica_ptr, "test_timeout", (), {
-            // If we get here, the mutex was successfully recovered from poisoning
+        {
+            let lock_arc = REPLICA_LOCKS.get(&replica_ptr).unwrap().clone();
+            let _guard = lock_arc.lock().unwrap_or_else(|p| p.into_inner());
             unsafe {
                 let replica = &mut *(replica_ptr as *mut Replica);
                 let task_uuid = Uuid::new_v4();
                 let mut ops = Operations::new();
-                
+
                 let mut task = replica.create_task(task_uuid, &mut ops)
                     .expect("Failed to create task after mutex recovery");
-                
+
                 task.set_description("Test after recovery".to_string(), &mut ops)
                     .expect("Failed to set description");
-                
+
                 replica.commit_operations(ops)
                     .expect("Failed to commit operations");
             }
-        });
+        }
         
         // Clean up
         REPLICA_LOCKS.remove(&replica_ptr);

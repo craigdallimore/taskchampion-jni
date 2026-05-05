@@ -1,0 +1,482 @@
+-- allium: 3
+-- taskchampion-jni.allium
+--
+-- Scope: Android JNI binding layer over the TaskChampion task management
+--        library. Specifies the contract observable from an Android (JVM)
+--        client calling into the native library.
+--
+-- Includes:
+--   * Replica session lifecycle (open, close)
+--   * Task creation, modification and queries
+--   * Tags, annotations and arbitrary key/value attributes
+--   * Undo-point journalling and undo
+--   * Synchronisation with a remote storage server (GCP or AWS S3)
+--   * Concurrency contract for shared replica access
+--
+-- Excludes:
+--   * TaskChampion library internals (operation log encoding, replica
+--     reconciliation, encryption details). Behavioural delegation is
+--     captured via the TaskChampionRuntime external entity.
+--   * JNI marshalling specifics (jlong handles, JString conversion,
+--     pointer arithmetic).
+--   * Android TLS certificate workarounds — incidental to making the
+--     library work on Android, not part of the API contract.
+--   * Specific concurrency primitives — the requirement is per-replica
+--     serialisation, not the chosen mutex implementation.
+--   * Build, distribution and packaging (Gradle, Cargo NDK, AAR).
+--   * Logging and diagnostic output.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity TaskChampionRuntime {
+    -- The underlying TaskChampion library. It owns the on-disk task
+    -- database, applies operation logs, reconciles concurrent edits
+    -- with a remote replica during sync, and encrypts the synced
+    -- payload. This specification describes the JNI surface; the
+    -- runtime governs the persistence and synchronisation semantics
+    -- behind it.
+}
+
+external entity NativeClient {
+    -- A JVM process that has loaded the libtaskchampion_jni native
+    -- library. The client opens replicas, performs operations and
+    -- closes them. Multiple threads within the same client process
+    -- may call concurrently.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum TaskStatus { pending | completed | deleted }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Replica {
+    -- A live session bound to a single on-disk task database. A client
+    -- opens a replica by directory and uses it for the lifetime of an
+    -- application session. Operations against the same replica are
+    -- serialised; distinct replicas may be used concurrently.
+
+    data_dir: String
+    status: open | closed
+
+    tasks:        Task        with replica = this
+    undo_points:  UndoPoint   with replica = this
+
+    transitions status {
+        open -> closed
+        terminal: closed
+    }
+}
+
+entity Task {
+    -- A unit of work, identified by a v4 UUID supplied by the client.
+    -- Tasks are never hard-deleted by this API; setting status to
+    -- `deleted` is a soft delete and the underlying record persists.
+
+    replica: Replica
+    uuid: String
+
+    description: String
+    status: TaskStatus
+    entry: Timestamp                  -- creation timestamp
+    modified: Timestamp               -- last-modification timestamp
+
+    tags: Set<String>
+
+    annotations:   Annotation with task = this
+    custom_values: TaskValue  with task = this
+}
+
+entity Annotation {
+    -- A timestamped note attached to a task. The (task, entry) pair
+    -- is the identity used when removing annotations.
+    task: Task
+    entry: Timestamp
+    description: String
+}
+
+entity TaskValue {
+    -- An arbitrary key/value attribute attached to a task. Used for
+    -- TaskWarrior-compatible attributes (project, priority, due, etc.)
+    -- that this API does not model as first-class fields.
+    task: Task
+    key: String
+    value: String
+}
+
+entity UndoPoint {
+    -- A boundary in the replica's operation journal. An Undo reverses
+    -- the operations recorded since the most recent undo point.
+    replica: Replica
+    created_at: Timestamp
+}
+
+entity ServerConfig {
+    -- The shape of the configuration parameter the client supplies
+    -- when initiating a sync. Every config carries a bucket name and
+    -- an encryption secret used to protect data at rest in the bucket.
+    kind: GcpConfig | AwsConfig
+    bucket: String
+    encryption_secret: String
+}
+
+variant GcpConfig : ServerConfig {
+    -- Synchronisation against a Google Cloud Storage bucket.
+    credential_path: String?    -- path to a service-account JSON key;
+                                -- null means use ambient credentials
+}
+
+variant AwsConfig : ServerConfig {
+    -- Synchronisation against an S3-compatible bucket.
+    region: String
+    credentials: AwsCredentials
+}
+
+entity AwsCredentials {
+    kind: AccessKeyCredentials | ProfileCredentials | DefaultCredentials
+}
+
+variant AccessKeyCredentials : AwsCredentials {
+    access_key_id: String
+    secret_access_key: String
+}
+
+variant ProfileCredentials : AwsCredentials {
+    profile_name: String
+}
+
+variant DefaultCredentials : AwsCredentials {
+    -- Use ambient AWS credentials (environment, instance metadata).
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ----- Replica lifecycle -----
+
+rule OpenReplica {
+    -- Open or create a task database at the given directory and return
+    -- a fresh replica session.
+    when: OpenReplica(data_dir)
+    ensures: Replica.created(
+        data_dir: data_dir,
+        status: open
+    )
+}
+
+rule CloseReplica {
+    when: CloseReplica(replica)
+    requires: replica.status = open
+    ensures: replica.status = closed
+}
+
+-- ----- Undo journalling -----
+
+rule AddUndoPoint {
+    -- Record a boundary in the operation journal. The next Undo will
+    -- reverse all operations recorded after this point.
+    when: AddUndoPoint(replica)
+    requires: replica.status = open
+    ensures: UndoPoint.created(replica: replica, created_at: now)
+}
+
+rule Undo {
+    -- Reverse the operations recorded since the most recent undo
+    -- point. If no undo point exists or the operations cannot be
+    -- reversed (concurrent changes detected), the call is a no-op
+    -- and the NativeClient is informed via the returned outcome.
+    when: Undo(replica)
+    requires: replica.status = open
+
+    @guidance
+        -- The boolean result returned to the NativeClient is true
+        -- when at least one operation was reversed, false otherwise.
+        -- The journal of UndoPoints is maintained by the
+        -- TaskChampionRuntime; this spec does not detail its
+        -- structure.
+}
+
+rule RebuildWorkingSet {
+    -- Refresh the 1-based pending-task index used by working-set
+    -- queries. Individual write operations (CreateTask,
+    -- SetTaskDescription, ...) commit to the operation journal
+    -- automatically; this trigger does not commit pending changes.
+    -- It is used after a batch of edits, or when the client wants to
+    -- renumber pending tasks. `renumber: true` reassigns indices to
+    -- all currently-pending tasks (the post-sync default);
+    -- `renumber: false` retains existing indices where possible.
+    when: RebuildWorkingSet(replica, renumber)
+    requires: replica.status = open
+}
+
+-- ----- Task creation and field updates -----
+
+rule CreateTask {
+    when: CreateTask(replica, uuid)
+    requires: replica.status = open
+    ensures: Task.created(
+        replica: replica,
+        uuid: uuid,
+        description: "",
+        status: pending,
+        entry: now,
+        modified: now,
+        tags: {}
+    )
+}
+
+rule SetTaskDescription {
+    when: SetTaskDescription(replica, uuid, description)
+    requires: replica.status = open
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    ensures: task.description = description
+    ensures: task.modified = now
+}
+
+rule SetTaskStatus {
+    when: SetTaskStatus(replica, uuid, new_status)
+    requires: replica.status = open
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    ensures: task.status = new_status
+    ensures: task.modified = now
+}
+
+rule SetTaskValue {
+    -- Set or erase an arbitrary key/value attribute on a task. When
+    -- `value` is null the entry for `key` is removed. Setting the
+    -- well-known key "modified" does not refresh the timestamp; any
+    -- other key updates `task.modified` to `now`.
+    when: SetTaskValue(replica, uuid, key, value?)
+    requires: replica.status = open
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    let existing = TaskValue{task: task, key: key}
+    ensures:
+        if value = null:
+            not exists existing
+        else:
+            if exists existing:
+                existing.value = value
+            else:
+                TaskValue.created(task: task, key: key, value: value)
+    ensures:
+        if key != "modified":
+            task.modified = now
+}
+
+rule AddTaskTag {
+    when: AddTaskTag(replica, uuid, tag)
+    requires: replica.status = open
+    requires: valid_tag_name(tag)
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    ensures: task.tags = task.tags + {tag}
+    ensures: task.modified = now
+
+    @guidance
+        -- valid_tag_name is the tag-name validator from the underlying
+        -- TaskChampion library: a tag must be non-empty, must not start
+        -- with a digit or virtual-tag prefix, and must contain only
+        -- characters permitted by TaskWarrior. Calls with invalid tags
+        -- are rejected at the boundary; the binding does not coerce.
+}
+
+rule RemoveTaskTag {
+    when: RemoveTaskTag(replica, uuid, tag)
+    requires: replica.status = open
+    requires: valid_tag_name(tag)
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    ensures: task.tags = task.tags - {tag}
+    ensures: task.modified = now
+}
+
+rule AddTaskAnnotation {
+    when: AddTaskAnnotation(replica, uuid, description)
+    requires: replica.status = open
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    ensures: Annotation.created(task: task, entry: now, description: description)
+    ensures: task.modified = now
+}
+
+rule RemoveTaskAnnotation {
+    when: RemoveTaskAnnotation(replica, uuid, entry)
+    requires: replica.status = open
+    let task = Task{replica: replica, uuid: uuid}
+    requires: exists task
+    let annotation = Annotation{task: task, entry: entry}
+    requires: exists annotation
+    ensures: not exists annotation
+    ensures: task.modified = now
+}
+
+-- ----- Synchronisation -----
+
+rule SyncReplica {
+    -- Exchange operations with a remote storage server. The remote
+    -- payload is encrypted with the client's encryption secret. On
+    -- successful sync the working set is rebuilt with renumbering so
+    -- that pending task indices reflect any merged changes.
+    when: SyncReplica(replica, server)
+    requires: replica.status = open
+    requires: server.encryption_secret != ""
+    requires: server.bucket != ""
+
+    @guidance
+        -- The Java surface exposes one method per ServerConfig variant
+        -- — nativeSyncGcp, nativeSyncAwsAccessKey, nativeSyncAwsProfile
+        -- and nativeSyncAwsDefault — rather than a single
+        -- discriminator-driven entry point. Each method's parameters
+        -- map directly to the fields of the corresponding variant.
+        -- Failure modes (invalid configuration, transport error,
+        -- TLS-related panics) all surface as SyncException; success
+        -- returns void.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant TaskUuidUniquePerReplica {
+    -- Within a single replica, no two tasks share a UUID.
+    for a in Tasks:
+        for b in Tasks:
+            a != b and a.replica = b.replica
+                implies a.uuid != b.uuid
+}
+
+invariant AnnotationEntryUniquePerTask {
+    -- Annotations on the same task have distinct entry timestamps.
+    -- The (task, entry) pair is the identity used by RemoveTaskAnnotation,
+    -- so a collision would make the lookup ambiguous.
+    for a in Annotations:
+        for b in Annotations:
+            a != b and a.task = b.task
+                implies a.entry != b.entry
+}
+
+invariant TaskValueKeyUniquePerTask {
+    -- Each task has at most one TaskValue for a given key.
+    for a in TaskValues:
+        for b in TaskValues:
+            a != b and a.task = b.task
+                implies a.key != b.key
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface NativeRuntime {
+    -- The entry-point surface for opening new replicas. There is no
+    -- per-replica context; this is the global API for instantiating
+    -- replica sessions.
+    facing client: NativeClient
+
+    provides:
+        OpenReplica(data_dir)
+
+    @guarantee ConcurrentReplicas
+        -- The runtime supports any number of concurrently-open
+        -- replicas. Operations on different replicas proceed
+        -- independently.
+}
+
+surface ReplicaApi {
+    -- Per-replica API surface. Every operation requires the replica
+    -- to be open; calls against a closed replica are an error.
+    facing client: NativeClient
+    context replica: Replica where status = open
+
+    exposes:
+        replica.tasks
+        replica.undo_points
+
+    provides:
+        CloseReplica(replica)
+
+        AddUndoPoint(replica)
+        Undo(replica)
+        RebuildWorkingSet(replica, renumber)
+
+        CreateTask(replica, uuid)
+        SetTaskDescription(replica, uuid, description)
+        SetTaskStatus(replica, uuid, new_status)
+        SetTaskValue(replica, uuid, key, value)
+        AddTaskTag(replica, uuid, tag)
+        RemoveTaskTag(replica, uuid, tag)
+        AddTaskAnnotation(replica, uuid, description)
+        RemoveTaskAnnotation(replica, uuid, entry)
+
+        SyncReplica(replica, server)
+
+    @guarantee SerialisedReplicaAccess
+        -- Operations against a single replica are serialised: a call
+        -- is observed atomically with respect to any concurrent call
+        -- against the same replica from another thread.
+
+    @guarantee CallerSuppliedUuids
+        -- Task UUIDs are generated by the client, not the runtime.
+        -- The client is responsible for ensuring uniqueness within
+        -- the replica; collisions are rejected by the runtime.
+
+    @guarantee FailuresAreObservable
+        -- Every failure mode is reported to the client as a thrown
+        -- exception in the TaskChampionException hierarchy. Errors
+        -- are never silently dropped: invalid handles raise
+        -- InvalidReplicaException; malformed identifiers raise
+        -- InvalidUuidException, InvalidStatusException or
+        -- InvalidTagException; failures originating from the
+        -- underlying library raise TaskChampionStorageException;
+        -- synchronisation failures raise SyncException.
+
+    @guarantee NoProcessCrash
+        -- A Rust panic in the binding or in the underlying library
+        -- never crosses the JNI boundary into the JVM. Panics are
+        -- caught at every entry point and translated into a
+        -- TaskChampionException; the JVM continues to run.
+}
+
+surface TaskQuery {
+    -- Read-only view of an open replica's tasks. The 1-based working-
+    -- set index is the TaskWarrior convention for addressing pending
+    -- tasks from the user interface.
+    facing client: NativeClient
+    context replica: Replica where status = open
+
+    exposes:
+        replica.tasks
+        replica.tasks.uuid
+        replica.tasks.description
+        replica.tasks.status
+        replica.tasks.entry
+        replica.tasks.modified
+        replica.tasks.tags
+        replica.tasks.annotations
+        replica.tasks.custom_values
+
+    @guidance
+        -- The runtime additionally exposes a 1-based index over the
+        -- working set (the set of currently pending tasks), permitting
+        -- the client to translate a CLI-style numeric ID into the
+        -- corresponding task UUID. The ordering of the working set is
+        -- governed by the TaskChampionRuntime and is not specified
+        -- here.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "GetTaskData currently returns task state as a JSON string with array-indexed keys for tags and annotations (`tag_0`, `annotation_0_entry`, ...). Should the wire format be a structured object derived from the entity model rather than ad hoc string serialisation?"
+
