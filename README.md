@@ -2,14 +2,6 @@
 
 JNI bindings for the [TaskChampion](https://github.com/GothenburgBitFactory/taskchampion) task management library, enabling Android applications to use TaskWarrior-compatible task management.
 
-## Features
-
-- Task creation, modification, and deletion
-- Tag and annotation management  
-- Undo/redo operations
-- Cloud synchronization support
-- **Thread-safe**: Per-replica synchronization for concurrent access
-
 ## Installation
 
 ### Option 1: GitHub Releases (Recommended)
@@ -18,7 +10,7 @@ Download the latest AAR from [Releases](https://github.com/craigdallimore/taskch
 
 ```gradle
 dependencies {
-    implementation files('libs/taskchampion-jni-0.1.10-alpha.aar')
+    implementation files('libs/taskchampion-jni-0.2.1-alpha.aar')
 }
 ```
 
@@ -36,18 +28,15 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.craigdallimore:taskchampion-jni:0.1.10-alpha'
+    implementation 'io.github.craigdallimore:taskchampion-jni:0.2.1-alpha'
 }
 ```
 
-## Running tests
+## Tests
 
- Android/Java tests:
-  - ./gradlew test (unit tests)
-  - ./gradlew connectedAndroidTest (instrumented tests)
-
-  Rust tests:
-  - cargo test
+```
+cargo test
+```
 
 ## License
 
