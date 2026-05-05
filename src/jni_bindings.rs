@@ -710,7 +710,7 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             None => {
                 throw(
                     &mut env,
-                    "java/lang/IllegalArgumentException",
+                    EXC_STORAGE,
                     &format!("Invalid annotation entry timestamp: {}", entry_timestamp),
                 );
                 return;
@@ -917,6 +917,7 @@ fn do_sync(env: &mut JNIEnv, replica_ptr: jlong, method_name: &str, server_confi
         ServerCreate(String),
         Failed(String),
         TlsPanic,
+        PostSyncRebuild(String),
     }
 
     let result: Result<(), SyncFailure> = run_with_replica(
@@ -937,12 +938,13 @@ fn do_sync(env: &mut JNIEnv, replica_ptr: jlong, method_name: &str, server_confi
             match sync_result {
                 Ok(Ok(())) => {
                     info!("Sync completed successfully");
-                    if let Err(e) = replica.rebuild_working_set(true) {
-                        error!("Failed to rebuild working set after sync: {:?}", e);
-                    } else {
-                        info!("Working set rebuilt after sync");
+                    match replica.rebuild_working_set(true) {
+                        Ok(()) => {
+                            info!("Working set rebuilt after sync");
+                            Ok(Ok(()))
+                        }
+                        Err(e) => Ok(Err(SyncFailure::PostSyncRebuild(format!("{}", e)))),
                     }
-                    Ok(Ok(()))
                 }
                 Ok(Err(e)) => Ok(Err(SyncFailure::Failed(format!("{}", e)))),
                 Err(panic_err) => {
@@ -968,6 +970,17 @@ fn do_sync(env: &mut JNIEnv, replica_ptr: jlong, method_name: &str, server_confi
                 "Sync failed due to a TLS-related panic in the underlying library (a known limitation with AWS sync on Android).",
             );
         }
+        Err(SyncFailure::PostSyncRebuild(msg)) => {
+            error!("Failed to rebuild working set after sync: {}", msg);
+            throw(
+                env,
+                EXC_STORAGE,
+                &format!(
+                    "Sync succeeded but post-sync working-set rebuild failed: {}",
+                    msg
+                ),
+            );
+        }
     }
 }
 
@@ -982,6 +995,10 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
 ) {
     catch_panics!(&mut env, "nativeSyncGcp", (), {
         let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        if bucket.is_empty() {
+            throw(&mut env, EXC_SYNC, "bucket must not be empty");
+            return;
+        }
         let credential_path = if credential_path.is_null() {
             None
         } else {
@@ -1022,6 +1039,10 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     catch_panics!(&mut env, "nativeSyncAwsAccessKey", (), {
         let region = match read_jstring(&mut env, &region, "region") { Some(s) => s, None => return };
         let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        if bucket.is_empty() {
+            throw(&mut env, EXC_SYNC, "bucket must not be empty");
+            return;
+        }
         let access_key_id = match read_jstring(&mut env, &access_key_id, "accessKeyId") { Some(s) => s, None => return };
         let secret_access_key = match read_jstring(&mut env, &secret_access_key, "secretAccessKey") { Some(s) => s, None => return };
         let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") { Some(s) => s, None => return };
@@ -1053,6 +1074,10 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     catch_panics!(&mut env, "nativeSyncAwsProfile", (), {
         let region = match read_jstring(&mut env, &region, "region") { Some(s) => s, None => return };
         let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        if bucket.is_empty() {
+            throw(&mut env, EXC_SYNC, "bucket must not be empty");
+            return;
+        }
         let profile_name = match read_jstring(&mut env, &profile_name, "profileName") { Some(s) => s, None => return };
         let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") { Some(s) => s, None => return };
         let encryption_secret = match parse_encryption_secret(&mut env, &encryption_secret_str) {
@@ -1082,6 +1107,10 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     catch_panics!(&mut env, "nativeSyncAwsDefault", (), {
         let region = match read_jstring(&mut env, &region, "region") { Some(s) => s, None => return };
         let bucket = match read_jstring(&mut env, &bucket, "bucket") { Some(s) => s, None => return };
+        if bucket.is_empty() {
+            throw(&mut env, EXC_SYNC, "bucket must not be empty");
+            return;
+        }
         let encryption_secret_str = match read_jstring(&mut env, &encryption_secret, "encryptionSecret") { Some(s) => s, None => return };
         let encryption_secret = match parse_encryption_secret(&mut env, &encryption_secret_str) {
             Some(b) => b,

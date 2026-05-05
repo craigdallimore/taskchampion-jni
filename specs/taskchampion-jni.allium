@@ -68,6 +68,14 @@ entity Replica {
     tasks:        Task        with replica = this
     undo_points:  UndoPoint   with replica = this
 
+    -- The working set is a sparse 1-based ordered view of currently-
+    -- pending tasks, in TaskWarrior's CLI-numbering convention. Index
+    -- positions where a previously-pending task has been completed or
+    -- deleted hold null until the next RebuildWorkingSet renumber.
+    -- The ordering of entries is governed by the TaskChampionRuntime
+    -- and is not specified here.
+    working_set: List<Task?>
+
     transitions status {
         open -> closed
         terminal: closed
@@ -347,9 +355,14 @@ rule SyncReplica {
         -- and nativeSyncAwsDefault — rather than a single
         -- discriminator-driven entry point. Each method's parameters
         -- map directly to the fields of the corresponding variant.
-        -- Failure modes (invalid configuration, transport error,
-        -- TLS-related panics) all surface as SyncException; success
-        -- returns void.
+        -- Failure modes during the sync itself (invalid configuration,
+        -- transport error, TLS-related panics) surface as
+        -- SyncException. If the sync exchange succeeds but the
+        -- subsequent working-set rebuild fails, the failure surfaces
+        -- as TaskChampionStorageException with a message that
+        -- distinguishes it from a sync failure; the remote payload
+        -- has already been exchanged and the caller may retry the
+        -- rebuild via RebuildWorkingSet. Success returns void.
 }
 
 ------------------------------------------------------------
@@ -475,12 +488,6 @@ surface TaskQuery {
         replica.tasks.annotations
         replica.tasks.custom_values
 
-    @guidance
-        -- The runtime additionally exposes a 1-based index over the
-        -- working set (the set of currently pending tasks), permitting
-        -- the client to translate a CLI-style numeric ID into the
-        -- corresponding task UUID. The ordering of the working set is
-        -- governed by the TaskChampionRuntime and is not specified
-        -- here.
+        replica.working_set
 }
 

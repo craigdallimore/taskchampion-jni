@@ -276,13 +276,19 @@ public class TaskChampionJniImpl {
      * Synchronise with a Google Cloud Storage bucket.
      *
      * @param replicaPtr Pointer to the replica
-     * @param bucket Name of the GCS bucket
+     * @param bucket Name of the GCS bucket; must be non-empty
      * @param credentialPath Path to a service-account JSON key file, or
      *                       {@code null} to use ambient credentials
      * @param encryptionSecret Secret used to encrypt the synced payload
      *                         at rest in the bucket; must be non-empty
      * @throws SyncException on any synchronisation failure (including
      *                       invalid configuration and TLS panics)
+     * @throws TaskChampionStorageException if the sync exchange
+     *                       succeeded but the subsequent working-set
+     *                       rebuild failed; the remote payload has
+     *                       already been exchanged and the caller may
+     *                       retry the rebuild via
+     *                       {@link #nativeRebuildWorkingSet}
      * @throws InvalidReplicaException if replicaPtr is null or unregistered
      */
     public static native void nativeSyncGcp(
@@ -298,12 +304,18 @@ public class TaskChampionJniImpl {
      *
      * @param replicaPtr Pointer to the replica
      * @param region AWS region (e.g. "us-east-1")
-     * @param bucket Name of the S3 bucket
+     * @param bucket Name of the S3 bucket; must be non-empty
      * @param accessKeyId AWS access key ID
      * @param secretAccessKey AWS secret access key
      * @param encryptionSecret Secret used to encrypt the synced payload;
      *                         must be non-empty
      * @throws SyncException on any synchronisation failure
+     * @throws TaskChampionStorageException if the sync exchange
+     *                       succeeded but the subsequent working-set
+     *                       rebuild failed; the remote payload has
+     *                       already been exchanged and the caller may
+     *                       retry the rebuild via
+     *                       {@link #nativeRebuildWorkingSet}
      * @throws InvalidReplicaException if replicaPtr is null or unregistered
      */
     public static native void nativeSyncAwsAccessKey(
@@ -321,11 +333,17 @@ public class TaskChampionJniImpl {
      *
      * @param replicaPtr Pointer to the replica
      * @param region AWS region
-     * @param bucket Name of the S3 bucket
+     * @param bucket Name of the S3 bucket; must be non-empty
      * @param profileName Name of the AWS profile to use
      * @param encryptionSecret Secret used to encrypt the synced payload;
      *                         must be non-empty
      * @throws SyncException on any synchronisation failure
+     * @throws TaskChampionStorageException if the sync exchange
+     *                       succeeded but the subsequent working-set
+     *                       rebuild failed; the remote payload has
+     *                       already been exchanged and the caller may
+     *                       retry the rebuild via
+     *                       {@link #nativeRebuildWorkingSet}
      * @throws InvalidReplicaException if replicaPtr is null or unregistered
      */
     public static native void nativeSyncAwsProfile(
@@ -343,10 +361,16 @@ public class TaskChampionJniImpl {
      *
      * @param replicaPtr Pointer to the replica
      * @param region AWS region
-     * @param bucket Name of the S3 bucket
+     * @param bucket Name of the S3 bucket; must be non-empty
      * @param encryptionSecret Secret used to encrypt the synced payload;
      *                         must be non-empty
      * @throws SyncException on any synchronisation failure
+     * @throws TaskChampionStorageException if the sync exchange
+     *                       succeeded but the subsequent working-set
+     *                       rebuild failed; the remote payload has
+     *                       already been exchanged and the caller may
+     *                       retry the rebuild via
+     *                       {@link #nativeRebuildWorkingSet}
      * @throws InvalidReplicaException if replicaPtr is null or unregistered
      */
     public static native void nativeSyncAwsDefault(
