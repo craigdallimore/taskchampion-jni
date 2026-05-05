@@ -307,6 +307,15 @@ rule AddTaskAnnotation {
     requires: exists task
     ensures: Annotation.created(task: task, entry: now, description: description)
     ensures: task.modified = now
+
+    @guidance
+        -- The underlying TaskChampion library keys annotations by the
+        -- entry's second-precision Unix timestamp. Two AddTaskAnnotation
+        -- calls on the same task within the same second collapse into a
+        -- single annotation carrying the most recent description; the
+        -- earlier one is silently lost. The
+        -- AnnotationEntryUniquePerTask invariant is preserved by this
+        -- storage behaviour, not by an explicit rule precondition.
 }
 
 rule RemoveTaskAnnotation {
@@ -436,8 +445,9 @@ surface ReplicaApi {
         -- are never silently dropped: invalid handles raise
         -- InvalidReplicaException; malformed identifiers raise
         -- InvalidUuidException, InvalidStatusException or
-        -- InvalidTagException; failures originating from the
-        -- underlying library raise TaskChampionStorageException;
+        -- InvalidTagException; replica-initialisation failures raise
+        -- ReplicaInitializationException; failures originating from
+        -- the underlying library raise TaskChampionStorageException;
         -- synchronisation failures raise SyncException.
 
     @guarantee NoProcessCrash
