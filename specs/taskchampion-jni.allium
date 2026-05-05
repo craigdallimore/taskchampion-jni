@@ -484,9 +484,3 @@ surface TaskQuery {
         -- here.
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "GetTaskData currently returns task state as a JSON string with array-indexed keys for tags and annotations (`tag_0`, `annotation_0_entry`, ...). Should the wire format be a structured object derived from the entity model rather than ad hoc string serialisation?"
-

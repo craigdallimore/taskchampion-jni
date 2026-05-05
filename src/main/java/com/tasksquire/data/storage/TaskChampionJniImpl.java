@@ -226,10 +226,39 @@ public class TaskChampionJniImpl {
     public static native String[] nativeGetAllTaskUuids(long replicaPtr);
     
     /**
-     * Get task data as JSON string
+     * Get a task's full state as a JSON string.
+     *
+     * <p>The returned JSON has the following shape:
+     * <pre>
+     * {
+     *   "uuid": "abc-…",
+     *   "description": "…",
+     *   "status": "pending",
+     *   "entry": "1234567890",
+     *   "modified": "1234567899",
+     *   "tags": ["work", "priority"],
+     *   "annotations": [
+     *     {"entry": "1234567890", "description": "first note"}
+     *   ],
+     *   "udas": {
+     *     "project": "home",
+     *     "priority": "H"
+     *   }
+     * }
+     * </pre>
+     *
+     * <p>All scalar values are encoded as JSON strings (matching
+     * TaskChampion's underlying string-keyed storage). The {@code uuid},
+     * {@code tags}, {@code annotations}, and {@code udas} keys are
+     * always present; the well-known fields ({@code description},
+     * {@code status}, {@code entry}, {@code modified}) appear only when
+     * the underlying task has them set. Annotation entries are
+     * second-precision Unix timestamps.
+     *
      * @param replicaPtr Pointer to the replica
      * @param uuid Task UUID
-     * @return JSON string containing task data
+     * @return JSON string of the task's state, or {@code null} if no
+     *         task exists with the given UUID
      */
     public static native String nativeGetTaskData(long replicaPtr, String uuid);
     

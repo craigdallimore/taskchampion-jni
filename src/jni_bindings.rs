@@ -783,31 +783,60 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             }
         };
 
-        let mut task_map = std::collections::HashMap::new();
+        // Pluck well-known fields from the raw key/value map; route
+        // everything else (other than tag_* and annotation_* keys, which
+        // taskchampion uses for its own structural encoding) to udas.
+        use serde_json::{json, Map, Value};
+
+        let mut udas = Map::new();
+        let mut description: Option<Value> = None;
+        let mut status: Option<Value> = None;
+        let mut entry: Option<Value> = None;
+        let mut modified: Option<Value> = None;
 
         if let Some(task_data) = replica
             .get_task_data(task_uuid)
             .map_err(|e| format!("Failed to get task data: {}", e))?
         {
             for (key, value) in task_data.iter() {
-                task_map.insert(key.clone(), value.clone());
+                match key.as_str() {
+                    "description" => description = Some(Value::String(value.clone())),
+                    "status" => status = Some(Value::String(value.clone())),
+                    "entry" => entry = Some(Value::String(value.clone())),
+                    "modified" => modified = Some(Value::String(value.clone())),
+                    k if k.starts_with("tag_") => {} // exposed via the tags array
+                    k if k.starts_with("annotation_") => {} // exposed via the annotations array
+                    _ => {
+                        udas.insert(key.clone(), Value::String(value.clone()));
+                    }
+                }
             }
         }
 
-        let tags: Vec<Tag> = task.get_tags().collect();
-        for (i, tag) in tags.iter().enumerate() {
-            task_map.insert(format!("tag_{}", i), tag.to_string());
-        }
+        let tags_array: Vec<Value> = task
+            .get_tags()
+            .map(|t| Value::String(t.to_string()))
+            .collect();
 
-        let annotations: Vec<Annotation> = task.get_annotations().collect();
-        for (i, annotation) in annotations.iter().enumerate() {
-            task_map.insert(format!("annotation_{}_entry", i), annotation.entry.timestamp().to_string());
-            task_map.insert(format!("annotation_{}_description", i), annotation.description.clone());
-        }
+        let annotations_array: Vec<Value> = task
+            .get_annotations()
+            .map(|a| json!({
+                "entry": a.entry.timestamp().to_string(),
+                "description": a.description,
+            }))
+            .collect();
 
-        task_map.insert("uuid".to_string(), uuid_str.clone());
+        let mut root = Map::new();
+        root.insert("uuid".to_string(), Value::String(uuid_str.clone()));
+        if let Some(v) = description { root.insert("description".to_string(), v); }
+        if let Some(v) = status { root.insert("status".to_string(), v); }
+        if let Some(v) = entry { root.insert("entry".to_string(), v); }
+        if let Some(v) = modified { root.insert("modified".to_string(), v); }
+        root.insert("tags".to_string(), Value::Array(tags_array));
+        root.insert("annotations".to_string(), Value::Array(annotations_array));
+        root.insert("udas".to_string(), Value::Object(udas));
 
-        let json = serde_json::to_string(&task_map)
+        let json = serde_json::to_string(&Value::Object(root))
             .map_err(|e| format!("Failed to serialize task data to JSON: {}", e))?;
         info!("Retrieved task data for: {}", uuid_str);
         Ok(Some(json))
