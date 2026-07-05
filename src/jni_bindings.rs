@@ -416,15 +416,9 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
 
         run_with_replica(&mut env, replica_ptr, "nativeCreateTask", (), |replica| {
             let mut ops = Operations::new();
-            let mut task = replica
+            replica
                 .create_task(task_uuid, &mut ops)
                 .map_err(|e| format!("Failed to create task: {}", e))?;
-            let now = Utc::now().timestamp().to_string();
-            task.set_value("entry", Some(now.clone()), &mut ops)
-                .map_err(|e| format!("Failed to set entry timestamp: {}", e))?;
-            task.set_value("modified", Some(now), &mut ops)
-                .map_err(|e| format!("Failed to set modified timestamp: {}", e))?;
-            drop(task);
             replica
                 .commit_operations(ops)
                 .map_err(|e| format!("Failed to commit create task operations: {}", e))?;
@@ -1226,6 +1220,58 @@ mod tests {
         assert_eq!(retrieved_task.get_description(), "Test task description");
         assert_eq!(retrieved_task.get_status(), Status::Pending);
         assert_eq!(retrieved_task.get_value("project"), Some("test_project"));
+    }
+
+    #[test]
+    fn test_create_task_fresh_uuid_commits_empty_task() {
+        // The bare create path (create_task + commit, no field writes) must
+        // persist an empty task: no description, status, entry, or modified.
+        let (mut replica, _temp_dir) = create_test_replica();
+        let task_uuid = Uuid::new_v4();
+
+        let mut ops = Operations::new();
+        replica.create_task(task_uuid, &mut ops).expect("Failed to create task");
+        replica.commit_operations(ops).expect("Failed to commit operations");
+
+        let retrieved_task = replica.get_task(task_uuid)
+            .expect("Failed to get task")
+            .expect("Task not found after commit");
+        assert_eq!(retrieved_task.get_description(), "");
+        assert_eq!(retrieved_task.get_value("status"), None);
+        assert_eq!(retrieved_task.get_value("entry"), None);
+        assert_eq!(retrieved_task.get_value("modified"), None);
+    }
+
+    #[test]
+    fn test_create_task_existing_uuid_is_noop() {
+        // Mirrors nativeCreateTask's get-or-create contract: calling the
+        // create path with an existing UUID must leave the task untouched.
+        let (mut replica, _temp_dir) = create_test_replica();
+        let task_uuid = Uuid::new_v4();
+
+        // First create, then set some values (as a real caller would).
+        let mut ops = Operations::new();
+        let mut task = replica.create_task(task_uuid, &mut ops).expect("Failed to create task");
+        task.set_description("Original description".to_string(), &mut ops)
+            .expect("Failed to set description");
+        task.set_value("entry", Some("1700000000".to_string()), &mut ops)
+            .expect("Failed to set entry");
+        replica.commit_operations(ops).expect("Failed to commit operations");
+
+        // Second create with the same UUID — the create path as implemented
+        // in nativeCreateTask: create_task followed by commit_operations.
+        let mut ops = Operations::new();
+        replica.create_task(task_uuid, &mut ops).expect("Failed on second create");
+        assert!(ops.is_empty(), "Existing UUID should push no operations");
+        replica.commit_operations(ops).expect("Failed to commit operations");
+
+        // Stored values are unchanged and no duplicate task appeared.
+        let retrieved_task = replica.get_task(task_uuid)
+            .expect("Failed to get task")
+            .expect("Task not found");
+        assert_eq!(retrieved_task.get_description(), "Original description");
+        assert_eq!(retrieved_task.get_value("entry"), Some("1700000000"));
+        assert_eq!(replica.all_tasks().expect("Failed to get all tasks").len(), 1);
     }
 
     #[test]

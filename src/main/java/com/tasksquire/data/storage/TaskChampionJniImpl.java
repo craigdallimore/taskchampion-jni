@@ -152,7 +152,14 @@ public class TaskChampionJniImpl {
     // Task creation and basic operations
     
     /**
-     * Create a new task with the given UUID
+     * Get-or-create a task by UUID, equivalent to TaskChampion's
+     * {@code Replica::create_task}. If no task with the given UUID exists,
+     * an empty task is created: no fields are set, so status, description,
+     * entry, modified etc. are all absent until written (absent status is
+     * interpreted as pending by TaskChampion convention). If a task with
+     * the UUID already exists, the call is a no-op and the existing task
+     * is left unmodified; no exception is thrown.
+     *
      * @param replicaPtr Pointer to the replica
      * @param uuid Task UUID as string
      */
