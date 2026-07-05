@@ -192,21 +192,26 @@ fn parse_uuid(env: &mut JNIEnv, uuid_str: &str) -> Option<Uuid> {
 ///
 /// Behaviour:
 /// - If `replica_ptr` is 0 or no longer registered, throws
-///   InvalidReplicaException and returns `default` (the JVM observes
-///   the exception and ignores the return value).
+///   InvalidReplicaException and returns `None`.
 /// - If the closure returns `Err(msg)`, throws TaskChampionStorageException
-///   with that message and returns `default`.
-/// - If the closure returns `Ok(value)`, returns `value`.
+///   with that message and returns `None`.
+/// - If the closure returns `Ok(value)`, returns `Some(value)`.
+///
+/// `None` means a Java exception is now PENDING on `env`. The caller
+/// must return its sentinel to the JVM immediately without making any
+/// further JNI env call (except the Exception* family): any other env
+/// call with a pending exception is a JNI spec violation that aborts
+/// the process on Android ("FindClass called with pending exception").
 ///
 /// All JNI marshalling of inputs and outputs should happen outside this
 /// function so the lock is held only for the replica work itself.
+#[must_use]
 fn run_with_replica<'local, F, R>(
     env: &mut JNIEnv<'local>,
     replica_ptr: jlong,
     method_name: &str,
-    default: R,
     f: F,
-) -> R
+) -> Option<R>
 where
     F: FnOnce(&mut Replica) -> Result<R, String>,
 {
@@ -216,7 +221,7 @@ where
             EXC_INVALID_REPLICA,
             &format!("Null replica handle in {}", method_name),
         );
-        return default;
+        return None;
     }
 
     let result = match with_registered_replica(replica_ptr, method_name, f) {
@@ -230,74 +235,61 @@ where
                     method_name
                 ),
             );
-            return default;
+            return None;
         }
     };
 
     match result {
-        Ok(value) => value,
+        Ok(value) => Some(value),
         Err(msg) => {
             error!("{}", msg);
             throw(env, EXC_STORAGE, &msg);
-            default
+            None
         }
     }
 }
 
 
 
-// Helper function to create empty string array for error cases
-fn create_empty_string_array<'local>(env: &mut JNIEnv<'local>) -> jobjectArray {
-    match env.find_class("java/lang/String") {
-        Ok(string_class) => {
-            match env.new_object_array(0, &string_class, JObject::null()) {
-                Ok(empty_array) => empty_array.into_raw(),
-                Err(e) => {
-                    error!("Failed to create empty array: {:?}", e);
-                    std::ptr::null_mut()
-                }
-            }
-        }
-        Err(e) => {
-            error!("Failed to find String class: {:?}", e);
-            std::ptr::null_mut()
-        }
-    }
-}
-
-// Helper function to create string array
+// Helper function to create string array. Must only be called with no
+// exception pending. On JNI failure, returns null after ensuring an
+// exception is pending (either the one the failed JNI call raised, e.g.
+// OutOfMemoryError, or a TaskChampionStorageException thrown here) and
+// makes no further env calls — building a fallback array at that point
+// would abort the process.
 fn create_string_array<'local>(env: &mut JNIEnv<'local>, strings: Vec<String>) -> jobjectArray {
-    match env.find_class("java/lang/String") {
-        Ok(string_class) => {
-            match env.new_object_array(strings.len() as i32, &string_class, JObject::null()) {
-                Ok(java_array) => {
-                    for (i, s) in strings.iter().enumerate() {
-                        match env.new_string(s) {
-                            Ok(java_string) => {
-                                if let Err(e) = env.set_object_array_element(&java_array, i as i32, java_string) {
-                                    error!("Failed to set array element {}: {:?}", i, e);
-                                    return create_empty_string_array(env);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to create Java string: {:?}", e);
-                                return create_empty_string_array(env);
-                            }
-                        }
-                    }
-                    java_array.into_raw()
-                }
-                Err(e) => {
-                    error!("Failed to create Java array: {:?}", e);
-                    create_empty_string_array(env)
-                }
-            }
-        }
+    let string_class = match env.find_class("java/lang/String") {
+        Ok(c) => c,
         Err(e) => {
             error!("Failed to find String class: {:?}", e);
-            create_empty_string_array(env)
+            throw(env, EXC_STORAGE, &format!("Failed to marshal string array: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    let java_array = match env.new_object_array(strings.len() as i32, &string_class, JObject::null()) {
+        Ok(a) => a,
+        Err(e) => {
+            error!("Failed to create Java array: {:?}", e);
+            throw(env, EXC_STORAGE, &format!("Failed to marshal string array: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    for (i, s) in strings.iter().enumerate() {
+        let java_string = match env.new_string(s) {
+            Ok(js) => js,
+            Err(e) => {
+                error!("Failed to create Java string: {:?}", e);
+                throw(env, EXC_STORAGE, &format!("Failed to marshal string array: {}", e));
+                return std::ptr::null_mut();
+            }
+        };
+        if let Err(e) = env.set_object_array_element(&java_array, i as i32, java_string) {
+            error!("Failed to set array element {}: {:?}", i, e);
+            throw(env, EXC_STORAGE, &format!("Failed to marshal string array: {}", e));
+            return std::ptr::null_mut();
         }
     }
+    java_array.into_raw()
 }
 
 // Lifecycle management
@@ -391,7 +383,7 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             ConcurrentChanges,
         }
 
-        let outcome = run_with_replica(&mut env, replica_ptr, "nativeUndo", UndoOutcome::NoOpsToUndo, |replica| {
+        let outcome = run_with_replica(&mut env, replica_ptr, "nativeUndo", |replica| {
             let undo_ops = replica
                 .get_undo_operations()
                 .map_err(|e| format!("Failed to get undo operations: {}", e))?;
@@ -404,6 +396,11 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
                 Err(e) => Err(format!("Failed to commit undo operations: {}", e)),
             }
         });
+
+        let Some(outcome) = outcome else {
+            // Exception pending; return the sentinel without further env calls.
+            return 0;
+        };
 
         match outcome {
             UndoOutcome::Reversed => {
@@ -429,7 +426,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     replica_ptr: jlong,
 ) {
     catch_panics!(&mut env, "nativeAddUndoPoint", (), {
-        run_with_replica(&mut env, replica_ptr, "nativeAddUndoPoint", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeAddUndoPoint", |replica| {
             let mut ops = Operations::new();
             ops.push(Operation::UndoPoint);
             replica
@@ -450,7 +448,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
 ) {
     catch_panics!(&mut env, "nativeRebuildWorkingSet", (), {
         let renumber = renumber != 0;
-        run_with_replica(&mut env, replica_ptr, "nativeRebuildWorkingSet", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeRebuildWorkingSet", |replica| {
             replica
                 .rebuild_working_set(renumber)
                 .map_err(|e| format!("Failed to rebuild working set: {}", e))?;
@@ -473,7 +472,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return };
         let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
 
-        run_with_replica(&mut env, replica_ptr, "nativeCreateTask", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeCreateTask", |replica| {
             let mut ops = Operations::new();
             replica
                 .create_task(task_uuid, &mut ops)
@@ -500,7 +500,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
         let description = match read_jstring(&mut env, &desc, "description") { Some(s) => s, None => return };
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskSetDescription", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskSetDescription", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -548,7 +549,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             }
         };
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskSetStatus", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskSetStatus", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -594,7 +596,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         let value_present = value_opt.is_some();
         let key_for_log = key_str.clone();
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskSetValue", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskSetValue", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -643,7 +646,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             }
         };
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskAddTag", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskAddTag", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -685,7 +689,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             }
         };
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskRemoveTag", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskRemoveTag", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -721,7 +726,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return };
         let description = match read_jstring(&mut env, &desc, "description") { Some(s) => s, None => return };
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskAddAnnotation", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskAddAnnotation", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -770,7 +776,8 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             }
         };
 
-        run_with_replica(&mut env, replica_ptr, "nativeTaskRemoveAnnotation", (), |replica| {
+        // On None an exception is pending; nothing further touches env.
+        let _ = run_with_replica(&mut env, replica_ptr, "nativeTaskRemoveAnnotation", |replica| {
             let mut ops = Operations::new();
             let mut task = replica
                 .get_task(task_uuid)
@@ -865,13 +872,18 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     replica_ptr: jlong,
 ) -> jobjectArray {
     catch_panics!(&mut env, "nativeGetAllTaskUuids", std::ptr::null_mut(), {
-        let task_uuids = run_with_replica(&mut env, replica_ptr, "nativeGetAllTaskUuids", Vec::<String>::new(), |replica| {
+        let task_uuids = run_with_replica(&mut env, replica_ptr, "nativeGetAllTaskUuids", |replica| {
             let tasks = replica
                 .all_tasks()
                 .map_err(|e| format!("Failed to get all tasks: {}", e))?;
             info!("Found {} task UUIDs", tasks.len());
-            Ok(tasks.keys().map(|uuid| uuid.to_string()).collect())
+            Ok(tasks.keys().map(|uuid| uuid.to_string()).collect::<Vec<String>>())
         });
+
+        let Some(task_uuids) = task_uuids else {
+            // Exception pending; any further env call would abort the process.
+            return std::ptr::null_mut();
+        };
 
         create_string_array(&mut env, task_uuids)
     })
@@ -884,7 +896,7 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     replica_ptr: jlong,
 ) -> jobjectArray {
     catch_panics!(&mut env, "nativeGetAllTasks", std::ptr::null_mut(), {
-        let task_docs = run_with_replica(&mut env, replica_ptr, "nativeGetAllTasks", Vec::<String>::new(), |replica| {
+        let task_docs = run_with_replica(&mut env, replica_ptr, "nativeGetAllTasks", |replica| {
             let tasks = replica
                 .all_tasks()
                 .map_err(|e| format!("Failed to get all tasks: {}", e))?;
@@ -895,6 +907,11 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             info!("Retrieved {} tasks", docs.len());
             Ok(docs)
         });
+
+        let Some(task_docs) = task_docs else {
+            // Exception pending; any further env call would abort the process.
+            return std::ptr::null_mut();
+        };
 
         create_string_array(&mut env, task_docs)
     })
@@ -911,8 +928,9 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     let uuid_str = match read_jstring(&mut env, &uuid, "uuid") { Some(s) => s, None => return JObject::null().into() };
     let task_uuid = match parse_uuid(&mut env, &uuid_str) { Some(u) => u, None => return JObject::null().into() };
 
-    // None signals "task not found" — returned to Java as null. Storage errors throw.
-    let json_result: Option<String> = run_with_replica(&mut env, replica_ptr, "nativeGetTaskData", None, |replica| {
+    // Inner None signals "task not found" — returned to Java as null.
+    // Outer None signals a thrown exception. Storage errors throw.
+    let json_result: Option<Option<String>> = run_with_replica(&mut env, replica_ptr, "nativeGetTaskData", |replica| {
         let task = match replica
             .get_task(task_uuid)
             .map_err(|e| format!("Failed to get task: {}", e))?
@@ -928,6 +946,11 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         info!("Retrieved task data for: {}", uuid_str);
         Ok(Some(json))
     });
+
+    let Some(json_result) = json_result else {
+        // Exception pending; any further env call would abort the process.
+        return JObject::null().into();
+    };
 
     match json_result {
         Some(json) => match env.new_string(&json) {
@@ -951,7 +974,9 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
     index: jint,
 ) -> JString<'local> {
     catch_panics!(&mut env, "nativeGetUuidForIndex", JObject::null().into(), {
-    let uuid_string: Option<String> = run_with_replica(&mut env, replica_ptr, "nativeGetUuidForIndex", None, |replica| {
+    // Inner None signals "no task at this index" — returned to Java as
+    // null. Outer None signals a thrown exception.
+    let uuid_string: Option<Option<String>> = run_with_replica(&mut env, replica_ptr, "nativeGetUuidForIndex", |replica| {
         let working_set = replica
             .working_set()
             .map_err(|e| format!("Failed to get working set: {}", e))?;
@@ -968,11 +993,17 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         Ok(result)
     });
 
+    let Some(uuid_string) = uuid_string else {
+        // Exception pending; any further env call would abort the process.
+        return JObject::null().into();
+    };
+
     match uuid_string {
         Some(s) => match env.new_string(s) {
             Ok(jstr) => jstr,
             Err(e) => {
                 error!("Failed to create JString for UUID: {:?}", e);
+                throw(&mut env, EXC_STORAGE, &format!("Failed to marshal UUID: {}", e));
                 JObject::null().into()
             }
         },
@@ -1007,11 +1038,10 @@ fn do_sync(env: &mut JNIEnv, replica_ptr: jlong, method_name: &str, server_confi
         PostSyncRebuild(String),
     }
 
-    let result: Result<(), SyncFailure> = run_with_replica(
+    let result: Option<Result<(), SyncFailure>> = run_with_replica(
         env,
         replica_ptr,
         method_name,
-        Err(SyncFailure::Failed("lock unavailable".to_string())),
         |replica| {
             let mut server = match server_config.into_server() {
                 Ok(s) => s,
@@ -1041,6 +1071,12 @@ fn do_sync(env: &mut JNIEnv, replica_ptr: jlong, method_name: &str, server_confi
             }
         },
     );
+
+    let Some(result) = result else {
+        // InvalidReplicaException is pending; the `throw` helper below
+        // would no-op anyway, but return early for clarity.
+        return;
+    };
 
     match result {
         Ok(()) => {}
