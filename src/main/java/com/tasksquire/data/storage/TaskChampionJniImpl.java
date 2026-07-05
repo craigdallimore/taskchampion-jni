@@ -85,9 +85,12 @@ package com.tasksquire.data.storage;
  * value", which is a normal answer rather than a failure:
  * {@link #nativeGetUuidForIndex} returns {@code null} when no task occupies
  * the index, {@link #nativeGetTaskData} returns {@code null} when the task
- * does not exist, {@link #nativeGetAllTaskUuids} returns an empty array
- * when there are no tasks, and {@link #nativeUndo} returns {@code false}
- * when there is nothing to undo.
+ * does not exist, {@link #nativeGetAllTaskUuids} and
+ * {@link #nativeGetAllTasks} return an empty array when there are no
+ * tasks, and {@link #nativeUndo} returns {@code false} when there is
+ * nothing to undo. When reading many tasks, prefer the single
+ * {@link #nativeGetAllTasks} call over iterating
+ * {@link #nativeGetTaskData} per UUID.
  *
  * <p>Rust panics in the underlying library are caught at every native
  * entry point and re-thrown as {@link TaskChampionException}; they will
@@ -224,7 +227,25 @@ public class TaskChampionJniImpl {
      * @return Array of UUID strings
      */
     public static native String[] nativeGetAllTaskUuids(long replicaPtr);
-    
+
+    /**
+     * Get the full state of every task in the replica in a single call.
+     *
+     * <p>Each element is one task's JSON document in exactly the format
+     * described on {@link #nativeGetTaskData}. Element order is
+     * unspecified. Returns an empty array when the replica contains no
+     * tasks. Equivalent to TaskChampion's {@code Replica::all_tasks}.
+     *
+     * <p>This is the preferred way to read many tasks: it acquires the
+     * per-replica lock once and crosses the JNI boundary once, rather
+     * than once per task as with {@link #nativeGetAllTaskUuids} followed
+     * by {@link #nativeGetTaskData} for each UUID.
+     *
+     * @param replicaPtr Pointer to the replica
+     * @return Array of JSON strings, one per task
+     */
+    public static native String[] nativeGetAllTasks(long replicaPtr);
+
     /**
      * Get a task's full state as a JSON string.
      *

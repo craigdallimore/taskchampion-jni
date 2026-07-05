@@ -1,7 +1,7 @@
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jint, jlong, jobjectArray};
 use jni::JNIEnv;
-use taskchampion::{Replica, StorageConfig, Operations, Operation, Status, Tag, Annotation, ServerConfig};
+use taskchampion::{Replica, StorageConfig, Operations, Operation, Status, Tag, Annotation, ServerConfig, Task};
 use taskchampion::server::AwsCredentials;
 use uuid::Uuid;
 use chrono::Utc;
@@ -740,6 +740,71 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
 
 // Data retrieval
 
+/// Build the JSON document for a single task, in the schema documented on
+/// nativeGetTaskData: uuid, description?, status?, entry?, modified?,
+/// tags[], annotations[{entry, description}], udas{}.
+///
+/// Well-known fields are plucked from the raw key/value map; keys starting
+/// with `tag_` and `annotation_` (taskchampion's structural encoding) are
+/// skipped in favour of the tags/annotations arrays; everything else is
+/// routed to udas.
+fn task_to_json(uuid_str: &str, task: &Task) -> Result<String, String> {
+    use serde_json::{json, Map, Value};
+
+    let mut udas = Map::new();
+    let mut description: Option<Value> = None;
+    let mut status: Option<Value> = None;
+    let mut entry: Option<Value> = None;
+    let mut modified: Option<Value> = None;
+
+    // Task::get_taskmap is deprecated in favour of TaskData::properties,
+    // but TaskData is only reachable by consuming the Task
+    // (into_task_data), and no other &Task accessor enumerates the raw
+    // key/value map. Its content is identical to what
+    // Replica::get_task_data returns for the same task.
+    #[allow(deprecated)]
+    let taskmap = task.get_taskmap();
+    for (key, value) in taskmap.iter() {
+        match key.as_str() {
+            "description" => description = Some(Value::String(value.clone())),
+            "status" => status = Some(Value::String(value.clone())),
+            "entry" => entry = Some(Value::String(value.clone())),
+            "modified" => modified = Some(Value::String(value.clone())),
+            k if k.starts_with("tag_") => {} // exposed via the tags array
+            k if k.starts_with("annotation_") => {} // exposed via the annotations array
+            _ => {
+                udas.insert(key.clone(), Value::String(value.clone()));
+            }
+        }
+    }
+
+    let tags_array: Vec<Value> = task
+        .get_tags()
+        .map(|t| Value::String(t.to_string()))
+        .collect();
+
+    let annotations_array: Vec<Value> = task
+        .get_annotations()
+        .map(|a| json!({
+            "entry": a.entry.timestamp().to_string(),
+            "description": a.description,
+        }))
+        .collect();
+
+    let mut root = Map::new();
+    root.insert("uuid".to_string(), Value::String(uuid_str.to_string()));
+    if let Some(v) = description { root.insert("description".to_string(), v); }
+    if let Some(v) = status { root.insert("status".to_string(), v); }
+    if let Some(v) = entry { root.insert("entry".to_string(), v); }
+    if let Some(v) = modified { root.insert("modified".to_string(), v); }
+    root.insert("tags".to_string(), Value::Array(tags_array));
+    root.insert("annotations".to_string(), Value::Array(annotations_array));
+    root.insert("udas".to_string(), Value::Object(udas));
+
+    serde_json::to_string(&Value::Object(root))
+        .map_err(|e| format!("Failed to serialize task data to JSON: {}", e))
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeGetAllTaskUuids<'local>(
     mut env: JNIEnv<'local>,
@@ -756,6 +821,29 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         });
 
         create_string_array(&mut env, task_uuids)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nativeGetAllTasks<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    replica_ptr: jlong,
+) -> jobjectArray {
+    catch_panics!(&mut env, "nativeGetAllTasks", std::ptr::null_mut(), {
+        let task_docs = run_with_replica(&mut env, replica_ptr, "nativeGetAllTasks", Vec::<String>::new(), |replica| {
+            let tasks = replica
+                .all_tasks()
+                .map_err(|e| format!("Failed to get all tasks: {}", e))?;
+            let mut docs = Vec::with_capacity(tasks.len());
+            for (uuid, task) in tasks.iter() {
+                docs.push(task_to_json(&uuid.to_string(), task)?);
+            }
+            info!("Retrieved {} tasks", docs.len());
+            Ok(docs)
+        });
+
+        create_string_array(&mut env, task_docs)
     })
 }
 
@@ -783,61 +871,7 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
             }
         };
 
-        // Pluck well-known fields from the raw key/value map; route
-        // everything else (other than tag_* and annotation_* keys, which
-        // taskchampion uses for its own structural encoding) to udas.
-        use serde_json::{json, Map, Value};
-
-        let mut udas = Map::new();
-        let mut description: Option<Value> = None;
-        let mut status: Option<Value> = None;
-        let mut entry: Option<Value> = None;
-        let mut modified: Option<Value> = None;
-
-        if let Some(task_data) = replica
-            .get_task_data(task_uuid)
-            .map_err(|e| format!("Failed to get task data: {}", e))?
-        {
-            for (key, value) in task_data.iter() {
-                match key.as_str() {
-                    "description" => description = Some(Value::String(value.clone())),
-                    "status" => status = Some(Value::String(value.clone())),
-                    "entry" => entry = Some(Value::String(value.clone())),
-                    "modified" => modified = Some(Value::String(value.clone())),
-                    k if k.starts_with("tag_") => {} // exposed via the tags array
-                    k if k.starts_with("annotation_") => {} // exposed via the annotations array
-                    _ => {
-                        udas.insert(key.clone(), Value::String(value.clone()));
-                    }
-                }
-            }
-        }
-
-        let tags_array: Vec<Value> = task
-            .get_tags()
-            .map(|t| Value::String(t.to_string()))
-            .collect();
-
-        let annotations_array: Vec<Value> = task
-            .get_annotations()
-            .map(|a| json!({
-                "entry": a.entry.timestamp().to_string(),
-                "description": a.description,
-            }))
-            .collect();
-
-        let mut root = Map::new();
-        root.insert("uuid".to_string(), Value::String(uuid_str.clone()));
-        if let Some(v) = description { root.insert("description".to_string(), v); }
-        if let Some(v) = status { root.insert("status".to_string(), v); }
-        if let Some(v) = entry { root.insert("entry".to_string(), v); }
-        if let Some(v) = modified { root.insert("modified".to_string(), v); }
-        root.insert("tags".to_string(), Value::Array(tags_array));
-        root.insert("annotations".to_string(), Value::Array(annotations_array));
-        root.insert("udas".to_string(), Value::Object(udas));
-
-        let json = serde_json::to_string(&Value::Object(root))
-            .map_err(|e| format!("Failed to serialize task data to JSON: {}", e))?;
+        let json = task_to_json(&uuid_str, &task)?;
         info!("Retrieved task data for: {}", uuid_str);
         Ok(Some(json))
     });
@@ -1480,5 +1514,144 @@ mod tests {
             let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
             drop(boxed_replica);
         }
+    }
+
+    #[test]
+    fn test_task_to_json_bulk_round_trip() {
+        let (mut replica, _temp_dir) = create_test_replica();
+
+        // Create two tasks with descriptions, status, tags, annotations,
+        // UDAs, and explicit entry/modified timestamps.
+        let uuid_a = Uuid::new_v4();
+        let uuid_b = Uuid::new_v4();
+
+        let mut ops = Operations::new();
+        let mut task_a = replica.create_task(uuid_a, &mut ops).expect("Failed to create task A");
+        task_a.set_description("Task A".to_string(), &mut ops).expect("Failed to set description");
+        task_a.set_status(Status::Pending, &mut ops).expect("Failed to set status");
+        task_a.set_value("entry", Some("1700000000".to_string()), &mut ops).expect("Failed to set entry");
+        task_a.set_value("modified", Some("1700000001".to_string()), &mut ops).expect("Failed to set modified");
+        task_a.set_value("project", Some("alpha".to_string()), &mut ops).expect("Failed to set UDA");
+        let tag = Tag::try_from("work").expect("Failed to create tag");
+        task_a.add_tag(&tag, &mut ops).expect("Failed to add tag");
+        task_a.add_annotation(
+            Annotation {
+                entry: chrono::DateTime::from_timestamp(1700000002, 0).unwrap(),
+                description: "note on A".to_string(),
+            },
+            &mut ops,
+        ).expect("Failed to add annotation");
+
+        let mut task_b = replica.create_task(uuid_b, &mut ops).expect("Failed to create task B");
+        task_b.set_description("Task B".to_string(), &mut ops).expect("Failed to set description");
+        replica.commit_operations(ops).expect("Failed to commit operations");
+
+        // Build JSON for every task via the bulk path (all_tasks).
+        let all_tasks = replica.all_tasks().expect("Failed to get all tasks");
+        assert_eq!(all_tasks.len(), 2);
+
+        let json_a: serde_json::Value = serde_json::from_str(
+            &task_to_json(&uuid_a.to_string(), all_tasks.get(&uuid_a).expect("Task A missing"))
+                .expect("Failed to build JSON for task A"),
+        ).expect("Task A JSON did not parse");
+
+        assert_eq!(json_a["uuid"], uuid_a.to_string());
+        assert_eq!(json_a["description"], "Task A");
+        assert_eq!(json_a["status"], "pending");
+        assert_eq!(json_a["entry"], "1700000000");
+        assert_eq!(json_a["modified"], "1700000001");
+        // get_tags also yields taskchampion's synthetic tags (e.g.
+        // PENDING, UNBLOCKED), so assert membership rather than equality.
+        let tags_a: Vec<&str> = json_a["tags"]
+            .as_array()
+            .expect("tags is not an array")
+            .iter()
+            .map(|v| v.as_str().expect("tag is not a string"))
+            .collect();
+        assert!(tags_a.contains(&"work"), "tags {:?} missing 'work'", tags_a);
+        assert_eq!(
+            json_a["annotations"],
+            serde_json::json!([{"entry": "1700000002", "description": "note on A"}])
+        );
+        // UDAs must contain exactly the custom key: no leakage of the
+        // well-known fields or the tag_/annotation_ structural keys.
+        assert_eq!(json_a["udas"], serde_json::json!({"project": "alpha"}));
+
+        let json_b: serde_json::Value = serde_json::from_str(
+            &task_to_json(&uuid_b.to_string(), all_tasks.get(&uuid_b).expect("Task B missing"))
+                .expect("Failed to build JSON for task B"),
+        ).expect("Task B JSON did not parse");
+
+        assert_eq!(json_b["uuid"], uuid_b.to_string());
+        assert_eq!(json_b["description"], "Task B");
+        let tags_b: Vec<&str> = json_b["tags"]
+            .as_array()
+            .expect("tags is not an array")
+            .iter()
+            .map(|v| v.as_str().expect("tag is not a string"))
+            .collect();
+        assert!(!tags_b.contains(&"work"), "task B unexpectedly tagged 'work'");
+        assert_eq!(json_b["annotations"], serde_json::json!([]));
+        assert_eq!(json_b["udas"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_task_to_json_single_and_bulk_paths_match() {
+        let (mut replica, _temp_dir) = create_test_replica();
+        let task_uuid = Uuid::new_v4();
+
+        let mut ops = Operations::new();
+        let mut task = replica.create_task(task_uuid, &mut ops).expect("Failed to create task");
+        task.set_description("Compare paths".to_string(), &mut ops).expect("Failed to set description");
+        task.set_status(Status::Completed, &mut ops).expect("Failed to set status");
+        task.set_value("priority", Some("H".to_string()), &mut ops).expect("Failed to set UDA");
+        let tag = Tag::try_from("home").expect("Failed to create tag");
+        task.add_tag(&tag, &mut ops).expect("Failed to add tag");
+        task.add_annotation(
+            Annotation {
+                entry: chrono::DateTime::from_timestamp(1700000100, 0).unwrap(),
+                description: "compare note".to_string(),
+            },
+            &mut ops,
+        ).expect("Failed to add annotation");
+        replica.commit_operations(ops).expect("Failed to commit operations");
+
+        // Single-task path (as used by nativeGetTaskData).
+        let single_task = replica.get_task(task_uuid)
+            .expect("Failed to get task")
+            .expect("Task not found");
+        let single_json = task_to_json(&task_uuid.to_string(), &single_task)
+            .expect("Failed to build JSON via single path");
+
+        // Bulk path (as used by nativeGetAllTasks).
+        let all_tasks = replica.all_tasks().expect("Failed to get all tasks");
+        let bulk_json = task_to_json(
+            &task_uuid.to_string(),
+            all_tasks.get(&task_uuid).expect("Task missing from all_tasks"),
+        ).expect("Failed to build JSON via bulk path");
+
+        // Compare as parsed values so map key ordering cannot matter.
+        let single_value: serde_json::Value = serde_json::from_str(&single_json)
+            .expect("Single-path JSON did not parse");
+        let bulk_value: serde_json::Value = serde_json::from_str(&bulk_json)
+            .expect("Bulk-path JSON did not parse");
+        assert_eq!(single_value, bulk_value);
+    }
+
+    #[test]
+    fn test_all_tasks_empty_replica_yields_empty_docs() {
+        let (mut replica, _temp_dir) = create_test_replica();
+
+        let all_tasks = replica.all_tasks().expect("Failed to get all tasks");
+        assert!(all_tasks.is_empty());
+
+        // Mirror the nativeGetAllTasks closure: an empty replica must
+        // produce an empty vec of JSON documents (empty Java array).
+        let docs: Vec<String> = all_tasks
+            .iter()
+            .map(|(uuid, task)| task_to_json(&uuid.to_string(), task))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to build docs for empty replica");
+        assert!(docs.is_empty());
     }
 }
