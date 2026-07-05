@@ -10,7 +10,7 @@ Download the latest AAR from [Releases](https://github.com/craigdallimore/taskch
 
 ```gradle
 dependencies {
-    implementation files('libs/taskchampion-jni-0.2.1-alpha.aar')
+    implementation files('libs/taskchampion-jni-<version>.aar')
 }
 ```
 
@@ -28,9 +28,23 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.craigdallimore:taskchampion-jni:0.2.1-alpha'
+    implementation 'io.github.craigdallimore:taskchampion-jni:<version>'
 }
 ```
+
+## Concurrency
+
+Every native call is synchronous and blocks its calling thread. Calls against
+the same replica handle are serialised, and a sync holds that serialisation
+for its entire duration — the network round-trip plus the post-sync
+working-set rebuild — so a single-handle application will see every other
+call stall while a sync is in flight.
+
+To keep a UI responsive: make all calls off the main thread, and open two
+replica handles over the same data directory — one for user-facing
+operations, one for background sync. Operations on distinct handles proceed
+independently. See the `TaskChampionJniImpl` Javadoc and
+`specs/taskchampion-jni.allium` for the full concurrency contract.
 
 ## Tests
 
