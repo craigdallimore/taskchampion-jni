@@ -514,6 +514,23 @@ surface ReplicaApi {
         -- caught at every entry point and translated into a
         -- TaskChampionException; the JVM continues to run.
 
+    @guarantee SafeConcurrentClose
+        -- Closing a replica is safe to invoke while operations against
+        -- that same replica are still in flight. Because operations on a
+        -- replica are serialised (see SerialisedReplicaAccess), a close
+        -- observed concurrently with an in-flight operation neither
+        -- interrupts nor corrupts it: every operation already under way
+        -- completes normally, and the replica stays alive until the last
+        -- of them has finished. Only operations started after the close
+        -- has taken effect are refused, raising InvalidReplicaException
+        -- (see FailuresAreObservable). A replica handle is never reused:
+        -- once closed it can never come to address a different,
+        -- later-opened replica, so a stale reference fails cleanly rather
+        -- than acting on the wrong session. Together with NoProcessCrash,
+        -- this rules out the use-after-free a naive close would leave open
+        -- — freeing the session while another thread is still operating
+        -- on it.
+
     @guidance
         -- Because calls block the calling thread and a sync can hold a
         -- replica's serialised access for seconds (see

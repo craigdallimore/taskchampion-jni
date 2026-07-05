@@ -9,6 +9,7 @@ use log::{info, error, warn};
 use serde_json;
 use std::env;
 use std::panic;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
@@ -24,9 +25,78 @@ fn configure_android_tls() {
     info!("Configured TLS to use bundled certificates for Android compatibility");
 }
 
-// Per-replica mutex registry for thread safety
+// Replica handle registry.
+//
+// The `jlong` handles returned to Java are opaque identifiers allocated
+// from a monotonically increasing counter — never memory addresses.
+// Handle 0 is the invalid/failure sentinel and is never allocated, and
+// handles are never reused, so a stale handle from a destroyed replica
+// can never collide with a later replica (no ABA hazard).
+//
+// SAFETY PROPERTY: an operation can never observe a freed Replica. It
+// either finds the map entry — in which case its cloned Arc keeps the
+// Replica alive for the duration of the operation — or the entry is
+// absent and it throws InvalidReplicaException. nativeDestroy only
+// removes the map entry and never dereferences the replica; the Replica
+// itself is dropped when the last Arc holder (destroy or an in-flight
+// operation) finishes.
 lazy_static! {
-    static ref REPLICA_LOCKS: DashMap<jlong, Arc<Mutex<()>>> = DashMap::new();
+    static ref REPLICAS: DashMap<jlong, Arc<Mutex<SendReplica>>> = DashMap::new();
+}
+
+/// Newtype marking `Replica` as `Send` so it can live in the global
+/// registry and be used from whichever JVM thread makes the JNI call.
+///
+/// SAFETY: `Replica` is `!Send` only because taskchampion's
+/// `Box<dyn Storage>` trait object erases auto traits. Both concrete
+/// storages produced by `StorageConfig::into_storage` are `Send`:
+/// `SqliteStorage` holds a `rusqlite::Connection` (`unsafe impl Send`
+/// in rusqlite), and `InMemoryStorage` holds plain owned data. The
+/// per-replica `Mutex` additionally serialises all access, so the
+/// replica is only ever used by one thread at a time. (The previous
+/// raw-pointer scheme relied on the same property implicitly by
+/// dereferencing the replica from arbitrary JVM threads.)
+struct SendReplica(Replica);
+unsafe impl Send for SendReplica {}
+
+/// Next handle to allocate. Starts at 1; 0 is reserved as the failure
+/// sentinel returned by nativeInitialize on error.
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+/// Register a Replica in the registry and return its newly allocated
+/// opaque handle.
+fn register_replica(replica: Replica) -> jlong {
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    REPLICAS.insert(handle, Arc::new(Mutex::new(SendReplica(replica))));
+    handle
+}
+
+/// Non-JNI core of `run_with_replica`: look up the handle, lock the
+/// per-replica mutex, and run the closure with exclusive access to the
+/// Replica. Returns `None` if the handle is not registered (never was,
+/// or already destroyed). A poisoned mutex is recovered via
+/// `into_inner`.
+fn with_registered_replica<F, R>(handle: jlong, method_name: &str, f: F) -> Option<R>
+where
+    F: FnOnce(&mut Replica) -> R,
+{
+    // Clone the Arc and drop the DashMap ref guard *before* locking, so
+    // no shard guard is held across the (potentially long) mutex
+    // acquisition. From this point the cloned Arc alone keeps the
+    // Replica alive, even if nativeDestroy removes the entry
+    // concurrently.
+    let replica_arc = {
+        let entry = REPLICAS.get(&handle)?;
+        Arc::clone(entry.value())
+    };
+    let mut guard = match replica_arc.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("Replica mutex poisoned in {}, recovering", method_name);
+            poisoned.into_inner()
+        }
+    };
+    Some(f(&mut guard.0))
 }
 
 // Fully-qualified names of the Java exception classes thrown by this binding.
@@ -121,7 +191,7 @@ fn parse_uuid(env: &mut JNIEnv, uuid_str: &str) -> Option<Uuid> {
 /// to the replica. The lock is released before this function returns.
 ///
 /// Behaviour:
-/// - If `replica_ptr` is null or no longer registered, throws
+/// - If `replica_ptr` is 0 or no longer registered, throws
 ///   InvalidReplicaException and returns `default` (the JVM observes
 ///   the exception and ignores the return value).
 /// - If the closure returns `Err(msg)`, throws TaskChampionStorageException
@@ -144,36 +214,24 @@ where
         throw(
             env,
             EXC_INVALID_REPLICA,
-            &format!("Null replica pointer in {}", method_name),
+            &format!("Null replica handle in {}", method_name),
         );
         return default;
     }
 
-    let lock_arc = match REPLICA_LOCKS.get(&replica_ptr) {
-        Some(entry) => entry.clone(),
+    let result = match with_registered_replica(replica_ptr, method_name, f) {
+        Some(result) => result,
         None => {
             throw(
                 env,
                 EXC_INVALID_REPLICA,
                 &format!(
-                    "Invalid replica pointer in {} (not registered or already destroyed)",
+                    "Invalid replica handle in {} (not registered or already destroyed)",
                     method_name
                 ),
             );
             return default;
         }
-    };
-
-    let result = {
-        let _guard = match lock_arc.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!("Replica mutex poisoned in {}, recovering", method_name);
-                poisoned.into_inner()
-            }
-        };
-        let replica = unsafe { &mut *(replica_ptr as *mut Replica) };
-        f(replica)
     };
 
     match result {
@@ -277,12 +335,10 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
         };
 
         let replica = Replica::new(storage);
-        let boxed_replica = Box::new(replica);
-        let replica_ptr = Box::into_raw(boxed_replica) as jlong;
-        REPLICA_LOCKS.insert(replica_ptr, Arc::new(Mutex::new(())));
+        let handle = register_replica(replica);
 
-        info!("Replica initialized successfully, pointer: {}", replica_ptr);
-        replica_ptr
+        info!("Replica initialized successfully, handle: {}", handle);
+        handle
     })
 }
 
@@ -294,25 +350,28 @@ pub extern "system" fn Java_com_tasksquire_data_storage_TaskChampionJniImpl_nati
 ) {
     catch_panics!(&mut env, "nativeDestroy", (), {
         if replica_ptr == 0 {
-            throw(&mut env, EXC_INVALID_REPLICA, "Cannot destroy a null replica pointer");
+            throw(&mut env, EXC_INVALID_REPLICA, "Cannot destroy a null replica handle");
             return;
         }
 
-        info!("Destroying Replica with pointer: {}", replica_ptr);
+        info!("Destroying Replica with handle: {}", replica_ptr);
 
-        if REPLICA_LOCKS.remove(&replica_ptr).is_none() {
-            throw(
-                &mut env,
-                EXC_INVALID_REPLICA,
-                &format!("Replica pointer {} is not registered (already destroyed?)", replica_ptr),
-            );
-            return;
-        }
-
-        unsafe {
-            let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
-            drop(boxed_replica);
-            info!("Replica destroyed successfully");
+        // Removing the entry drops this registry's Arc. In-flight
+        // operations hold their own Arc clones, so the Replica is freed
+        // only when the last holder finishes; destroy itself never
+        // dereferences the replica. Any subsequent call with this handle
+        // finds no entry and throws InvalidReplicaException.
+        match REPLICAS.remove(&replica_ptr) {
+            Some(_) => {
+                info!("Replica handle {} destroyed successfully", replica_ptr);
+            }
+            None => {
+                throw(
+                    &mut env,
+                    EXC_INVALID_REPLICA,
+                    &format!("Replica handle {} is not registered (already destroyed?)", replica_ptr),
+                );
+            }
         }
     })
 }
@@ -1176,16 +1235,16 @@ mod tests {
     #[test]
     fn test_replica_lifecycle() {
         let (replica, _temp_dir) = create_test_replica();
-        let boxed_replica = Box::new(replica);
-        let replica_ptr = Box::into_raw(boxed_replica) as jlong;
-        
-        assert_ne!(replica_ptr, 0);
-        
-        // Clean up
-        unsafe {
-            let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
-            drop(boxed_replica);
-        }
+        let handle = register_replica(replica);
+
+        // 0 is the failure sentinel and must never be allocated.
+        assert_ne!(handle, 0);
+        assert!(REPLICAS.contains_key(&handle));
+
+        // Clean up (simulating nativeDestroy): removing the entry drops
+        // the registry's Arc, and with no other holders the Replica drops.
+        assert!(REPLICAS.remove(&handle).is_some());
+        assert!(!REPLICAS.contains_key(&handle));
     }
 
     #[test]
@@ -1421,28 +1480,19 @@ mod tests {
 
     #[test]
     fn test_concurrent_task_operations() {
-        use std::sync::Arc;
         use std::thread;
-        
+
         let (replica, _temp_dir) = create_test_replica();
-        let boxed_replica = Box::new(replica);
-        let replica_ptr = Box::into_raw(boxed_replica) as jlong;
-        
-        // Register the replica mutex
-        REPLICA_LOCKS.insert(replica_ptr, Arc::new(Mutex::new(())));
-        
+        let handle = register_replica(replica);
+
         let num_threads = 4;
         let tasks_per_thread = 10;
-        let mut handles = vec![];
-        
+        let mut join_handles = vec![];
+
         for thread_id in 0..num_threads {
-            let replica_ptr_clone = replica_ptr;
-            let handle = thread::spawn(move || {
+            let join_handle = thread::spawn(move || {
                 for i in 0..tasks_per_thread {
-                    let lock_arc = REPLICA_LOCKS.get(&replica_ptr_clone).unwrap().clone();
-                    let _guard = lock_arc.lock().unwrap_or_else(|p| p.into_inner());
-                    unsafe {
-                        let replica = &mut *(replica_ptr_clone as *mut Replica);
+                    with_registered_replica(handle, "test_concurrent_task_operations", |replica| {
                         let task_uuid = Uuid::new_v4();
                         let mut ops = Operations::new();
 
@@ -1454,112 +1504,169 @@ mod tests {
 
                         replica.commit_operations(ops)
                             .expect("Failed to commit operations");
-                    }
+                    })
+                    .expect("Handle should remain registered for the whole test");
                 }
             });
-            handles.push(handle);
+            join_handles.push(join_handle);
         }
 
-        for handle in handles {
-            handle.join().expect("Thread panicked");
+        for join_handle in join_handles {
+            join_handle.join().expect("Thread panicked");
         }
 
         // Verify all tasks were created
-        {
-            let lock_arc = REPLICA_LOCKS.get(&replica_ptr).unwrap().clone();
-            let _guard = lock_arc.lock().unwrap_or_else(|p| p.into_inner());
-            unsafe {
-                let replica = &mut *(replica_ptr as *mut Replica);
-                let all_tasks = replica.all_tasks().expect("Failed to get all tasks");
-                assert_eq!(all_tasks.len(), num_threads * tasks_per_thread);
-            }
-        }
-        
+        let total = with_registered_replica(handle, "test_concurrent_task_operations", |replica| {
+            replica.all_tasks().expect("Failed to get all tasks").len()
+        })
+        .expect("Handle should remain registered for the whole test");
+        assert_eq!(total, num_threads * tasks_per_thread);
+
         // Clean up
-        REPLICA_LOCKS.remove(&replica_ptr);
-        unsafe {
-            let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
-            drop(boxed_replica);
-        }
+        assert!(REPLICAS.remove(&handle).is_some());
     }
 
     #[test]
     fn test_timeout_handling() {
-        use std::sync::Arc;
         use std::thread;
-        
+
         let (replica, _temp_dir) = create_test_replica();
-        let boxed_replica = Box::new(replica);
-        let replica_ptr = Box::into_raw(boxed_replica) as jlong;
-        
-        // Register the replica mutex
-        REPLICA_LOCKS.insert(replica_ptr, Arc::new(Mutex::new(())));
-        
-        // Test that poisoned mutex is recovered from
-        let lock_arc = REPLICA_LOCKS.get(&replica_ptr).unwrap().clone();
-        
-        // Simulate a thread panic while holding the lock to poison it
-        let handle = thread::spawn(move || {
-            let _lock = lock_arc.lock().unwrap();
+        let handle = register_replica(replica);
+
+        // Test that a poisoned mutex is recovered from: panic while
+        // holding the per-replica lock.
+        let replica_arc = Arc::clone(REPLICAS.get(&handle).unwrap().value());
+        let join_handle = thread::spawn(move || {
+            let _lock = replica_arc.lock().unwrap();
             panic!("Simulated panic to poison mutex");
         });
-        
+
         // Wait for thread to panic
-        let _ = handle.join();
-        
-        // Now try to use the poisoned mutex - it should recover
-        {
-            let lock_arc = REPLICA_LOCKS.get(&replica_ptr).unwrap().clone();
-            let _guard = lock_arc.lock().unwrap_or_else(|p| p.into_inner());
-            unsafe {
-                let replica = &mut *(replica_ptr as *mut Replica);
-                let task_uuid = Uuid::new_v4();
-                let mut ops = Operations::new();
+        let _ = join_handle.join();
 
-                let mut task = replica.create_task(task_uuid, &mut ops)
-                    .expect("Failed to create task after mutex recovery");
+        // Now use the registry path against the poisoned mutex - it
+        // should recover.
+        with_registered_replica(handle, "test_timeout_handling", |replica| {
+            let task_uuid = Uuid::new_v4();
+            let mut ops = Operations::new();
 
-                task.set_description("Test after recovery".to_string(), &mut ops)
-                    .expect("Failed to set description");
+            let mut task = replica.create_task(task_uuid, &mut ops)
+                .expect("Failed to create task after mutex recovery");
 
-                replica.commit_operations(ops)
-                    .expect("Failed to commit operations");
-            }
-        }
-        
+            task.set_description("Test after recovery".to_string(), &mut ops)
+                .expect("Failed to set description");
+
+            replica.commit_operations(ops)
+                .expect("Failed to commit operations");
+        })
+        .expect("Handle should remain registered for the whole test");
+
         // Clean up
-        REPLICA_LOCKS.remove(&replica_ptr);
-        unsafe {
-            let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
-            drop(boxed_replica);
-        }
+        assert!(REPLICAS.remove(&handle).is_some());
     }
 
     #[test]
     fn test_replica_cleanup() {
         let (replica, _temp_dir) = create_test_replica();
-        let boxed_replica = Box::new(replica);
-        let replica_ptr = Box::into_raw(boxed_replica) as jlong;
-        
-        // Register the replica mutex
-        REPLICA_LOCKS.insert(replica_ptr, Arc::new(Mutex::new(())));
-        
-        // Verify mutex is registered
-        assert!(REPLICA_LOCKS.contains_key(&replica_ptr));
-        
+        let handle = register_replica(replica);
+
+        // Verify the handle is registered
+        assert!(REPLICAS.contains_key(&handle));
+
         // Clean up (simulating nativeDestroy)
-        if let Some((_, _)) = REPLICA_LOCKS.remove(&replica_ptr) {
-            // Mutex removed successfully
-        }
-        
-        // Verify mutex is removed
-        assert!(!REPLICA_LOCKS.contains_key(&replica_ptr));
-        
-        // Clean up replica
-        unsafe {
-            let boxed_replica = Box::from_raw(replica_ptr as *mut Replica);
-            drop(boxed_replica);
-        }
+        assert!(REPLICAS.remove(&handle).is_some());
+
+        // Verify the handle is removed; a second destroy finds nothing
+        // (nativeDestroy throws InvalidReplicaException in that case).
+        assert!(!REPLICAS.contains_key(&handle));
+        assert!(REPLICAS.remove(&handle).is_none());
+
+        // Operations against the destroyed handle fail cleanly with None
+        // (run_with_replica throws InvalidReplicaException in that case).
+        assert!(with_registered_replica(handle, "test_replica_cleanup", |_| ()).is_none());
+    }
+
+    #[test]
+    fn test_destroy_during_operation() {
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let (replica, _temp_dir) = create_test_replica();
+        let handle = register_replica(replica);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+
+        // Worker: hammer the registry path until the handle disappears
+        // (or the test tells it to stop).
+        let worker = thread::spawn(move || {
+            let mut completed = 0u32;
+            while !worker_stop.load(Ordering::Relaxed) {
+                let outcome =
+                    with_registered_replica(handle, "test_destroy_during_operation", |replica| {
+                        let task_uuid = Uuid::new_v4();
+                        let mut ops = Operations::new();
+                        replica.create_task(task_uuid, &mut ops)
+                            .expect("Failed to create task");
+                        replica.commit_operations(ops)
+                            .expect("Failed to commit operations");
+                    });
+                match outcome {
+                    Some(()) => completed += 1,
+                    // Handle destroyed mid-loop: the clean failure path
+                    // (a JNI caller would see InvalidReplicaException).
+                    None => break,
+                }
+            }
+            completed
+        });
+
+        // Let the worker run some operations, then destroy the handle
+        // while the worker may be mid-operation. remove() never
+        // dereferences the replica; the worker's cloned Arc keeps it
+        // alive until any in-flight operation completes.
+        thread::sleep(std::time::Duration::from_millis(20));
+        assert!(REPLICAS.remove(&handle).is_some());
+        stop.store(true, Ordering::Relaxed);
+
+        // No crash/UB: the worker either completed operations or bailed
+        // out cleanly when the handle vanished.
+        let _completed = worker.join().expect("Worker thread panicked");
+
+        // Post-destroy lookups find nothing.
+        assert!(REPLICAS.get(&handle).is_none());
+        assert!(
+            with_registered_replica(handle, "test_destroy_during_operation", |_| ()).is_none()
+        );
+    }
+
+    #[test]
+    fn test_stale_handle_after_reinitialize() {
+        // Destroying handle A and then initializing a new replica B must
+        // never let A resolve to B: handles come from a monotonic counter
+        // and are never reused, so the ABA hazard of address-based
+        // handles cannot occur.
+        let (replica_a, _temp_dir_a) = create_test_replica();
+        let handle_a = register_replica(replica_a);
+        assert!(REPLICAS.remove(&handle_a).is_some());
+
+        let (replica_b, _temp_dir_b) = create_test_replica();
+        let handle_b = register_replica(replica_b);
+
+        assert_ne!(handle_a, handle_b, "Handles must never be reused");
+        assert!(
+            with_registered_replica(handle_a, "test_stale_handle_after_reinitialize", |_| ())
+                .is_none(),
+            "Stale handle A must not resolve to any replica"
+        );
+
+        // Handle B still resolves normally.
+        with_registered_replica(handle_b, "test_stale_handle_after_reinitialize", |replica| {
+            replica.all_tasks().expect("Failed to get all tasks");
+        })
+        .expect("Handle B should resolve");
+
+        assert!(REPLICAS.remove(&handle_b).is_some());
     }
 
     #[test]

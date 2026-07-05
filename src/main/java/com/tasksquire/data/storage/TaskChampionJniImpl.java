@@ -28,7 +28,12 @@ package com.tasksquire.data.storage;
  * replica's work never blocks another's.
  *
  * <p>Replica handles (the {@code long} returned by {@link #nativeInitialize})
- * may be shared across threads.
+ * are <strong>opaque handles</strong> — identifiers into a native registry,
+ * not memory addresses — and may be shared across threads. Handles are
+ * never reused. {@link #nativeDestroy} is safe to call concurrently with
+ * in-flight operations on the same handle: those operations complete
+ * normally, and any call made after destroy returns throws
+ * {@link InvalidReplicaException}.
  *
  * <h3>Sync and the per-replica lock</h3>
  * <p>The sync methods ({@code nativeSyncGcp}, {@code nativeSyncAwsAccessKey},
@@ -107,13 +112,13 @@ public class TaskChampionJniImpl {
     /**
      * Initialize a new TaskChampion replica
      * @param dataDir Directory to store task data
-     * @return Pointer to the replica (0 on failure)
+     * @return Opaque handle to the replica (0 on failure)
      */
     public static native long nativeInitialize(String dataDir);
     
     /**
      * Destroy a TaskChampion replica and free resources
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      */
     public static native void nativeDestroy(long replicaPtr);
     
@@ -121,7 +126,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Undo the last set of operations
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @return true if undo was successful
      */
     public static native boolean nativeUndo(long replicaPtr);
@@ -129,7 +134,7 @@ public class TaskChampionJniImpl {
     /**
      * Add an undo point. The next undo will reverse all operations
      * recorded after this point.
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      */
     public static native void nativeAddUndoPoint(long replicaPtr);
     
@@ -141,7 +146,7 @@ public class TaskChampionJniImpl {
      * <em>not</em> commit pending changes (there are none) but does refresh
      * the index used by {@link #nativeGetUuidForIndex}.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param renumber if {@code true}, reassign 1-based indices to all
      *                 currently-pending tasks (matching the TaskWarrior
      *                 default after a sync); if {@code false}, retain
@@ -160,14 +165,14 @@ public class TaskChampionJniImpl {
      * the UUID already exists, the call is a no-op and the existing task
      * is left unmodified; no exception is thrown.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID as string
      */
     public static native void nativeCreateTask(long replicaPtr, String uuid);
     
     /**
      * Set the description of a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param description Task description
      */
@@ -175,7 +180,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Set the status of a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param status Task status ("pending", "completed", "deleted")
      */
@@ -185,7 +190,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Set a custom property on a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param key Property key
      * @param value Property value (null to remove)
@@ -194,7 +199,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Add a tag to a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param tag Tag to add
      */
@@ -202,7 +207,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Remove a tag from a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param tag Tag to remove
      */
@@ -212,7 +217,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Add an annotation to a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param description Annotation description
      */
@@ -220,7 +225,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Remove an annotation from a task
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @param entryTimestamp Timestamp of annotation entry
      */
@@ -230,7 +235,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Get all task UUIDs in the replica
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @return Array of UUID strings
      */
     public static native String[] nativeGetAllTaskUuids(long replicaPtr);
@@ -248,7 +253,7 @@ public class TaskChampionJniImpl {
      * than once per task as with {@link #nativeGetAllTaskUuids} followed
      * by {@link #nativeGetTaskData} for each UUID.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @return Array of JSON strings, one per task
      */
     public static native String[] nativeGetAllTasks(long replicaPtr);
@@ -283,7 +288,7 @@ public class TaskChampionJniImpl {
      * the underlying task has them set. Annotation entries are
      * second-precision Unix timestamps.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param uuid Task UUID
      * @return JSON string of the task's state, or {@code null} if no
      *         task exists with the given UUID
@@ -292,7 +297,7 @@ public class TaskChampionJniImpl {
     
     /**
      * Get UUID for a task at the given index in the working set
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param index 1-based index (TaskWarrior style)
      * @return UUID string or null if not found
      */
@@ -303,7 +308,7 @@ public class TaskChampionJniImpl {
     /**
      * Synchronise with a Google Cloud Storage bucket.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param bucket Name of the GCS bucket; must be non-empty
      * @param credentialPath Path to a service-account JSON key file, or
      *                       {@code null} to use ambient credentials
@@ -330,7 +335,7 @@ public class TaskChampionJniImpl {
      * Synchronise with an AWS S3-compatible bucket using an explicit
      * access-key credential pair.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param region AWS region (e.g. "us-east-1")
      * @param bucket Name of the S3 bucket; must be non-empty
      * @param accessKeyId AWS access key ID
@@ -359,7 +364,7 @@ public class TaskChampionJniImpl {
      * Synchronise with an AWS S3-compatible bucket using a named
      * credential profile from the host's AWS config.
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param region AWS region
      * @param bucket Name of the S3 bucket; must be non-empty
      * @param profileName Name of the AWS profile to use
@@ -387,7 +392,7 @@ public class TaskChampionJniImpl {
      * AWS credential chain (environment variables, shared credentials
      * file, EC2 instance metadata, etc.).
      *
-     * @param replicaPtr Pointer to the replica
+     * @param replicaPtr Opaque handle to the replica
      * @param region AWS region
      * @param bucket Name of the S3 bucket; must be non-empty
      * @param encryptionSecret Secret used to encrypt the synced payload;
